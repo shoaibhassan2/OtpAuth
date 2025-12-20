@@ -68,3 +68,4 @@ Designed for security enthusiasts who want full control over their 2FA tokens wi
 ```bash
 git clone [https://github.com/shoaibhassan2/OtpAuth.git](https://github.com/shoaibhassan2/OtpAuth.git)
 cd OtpAuth
+```
