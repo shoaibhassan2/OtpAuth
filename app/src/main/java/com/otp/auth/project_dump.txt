@@ -1,0 +1,3900 @@
+Project Structure and File Contents:
+
+├── MainActivity.kt
+
+--- File: MainActivity.kt ---
+@file:OptIn(ExperimentalMaterial3Api::class, ExperimentalAnimationApi::class)
+
+package com.otp.auth
+
+import android.net.Uri
+import android.os.Bundle
+import android.util.Log
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.biometric.BiometricManager
+import androidx.biometric.BiometricPrompt
+import androidx.compose.animation.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.google.android.gms.auth.api.signin.GoogleSignIn
+import com.google.android.gms.common.api.ApiException
+import com.otp.auth.crypto.TotpEngine
+import com.otp.auth.data.Account
+import com.otp.auth.data.AccountRepository
+import com.otp.auth.data.SettingsManager
+import com.otp.auth.ui.*
+import com.otp.auth.ui.theme.OtpAuthTheme
+import com.otp.auth.utils.BackupHelper
+import com.otp.auth.utils.GoogleAuthMigration
+import com.otp.auth.utils.GoogleDriveHelper
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.util.regex.Pattern
+
+class MainActivity : FragmentActivity() {
+    
+    private lateinit var settingsManager: SettingsManager
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val repository = AccountRepository(this)
+        settingsManager = SettingsManager(this)
+
+        setContent {
+            val themeMode by settingsManager.themeMode.collectAsState()
+            val isPrivacyEnabled by settingsManager.isPrivacyEnabled.collectAsState()
+            
+            var isUnlocked by remember { mutableStateOf(!isPrivacyEnabled) }
+            
+            val lifecycleOwner = LocalLifecycleOwner.current
+            DisposableEffect(lifecycleOwner) {
+                val observer = LifecycleEventObserver { _, event ->
+                    if (event == Lifecycle.Event.ON_START) {
+                        if (settingsManager.isPrivacyEnabled.value) {
+                            isUnlocked = false
+                        }
+                    }
+                }
+                lifecycleOwner.lifecycle.addObserver(observer)
+                onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+            }
+
+            LaunchedEffect(isUnlocked, isPrivacyEnabled) {
+                if (isPrivacyEnabled && !isUnlocked) {
+                    authenticateUser(
+                        title = "Unlock App",
+                        subtitle = "Use Biometrics to access accounts"
+                    ) { success -> isUnlocked = success }
+                } else if (!isPrivacyEnabled) {
+                    isUnlocked = true
+                }
+            }
+
+            OtpAuthTheme(themeMode = themeMode) {
+                if (isUnlocked) {
+                    OtpApp(repository, settingsManager, ::authenticateUser)
+                } else {
+                    LockedScreen(onUnlockClick = {
+                         authenticateUser(
+                             title = "Unlock App",
+                             subtitle = "Use Biometrics to access accounts"
+                         ) { success -> isUnlocked = success }
+                    })
+                }
+            }
+        }
+    }
+
+    private fun authenticateUser(
+        title: String = "Authentication Required", 
+        subtitle: String = "Verify your identity", 
+        onResult: (Boolean) -> Unit
+    ) {
+        val executor = ContextCompat.getMainExecutor(this)
+        val biometricPrompt = BiometricPrompt(this, executor,
+            object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                    super.onAuthenticationSucceeded(result)
+                    onResult(true)
+                }
+                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                    super.onAuthenticationError(errorCode, errString)
+                    onResult(false)
+                }
+                override fun onAuthenticationFailed() {
+                    super.onAuthenticationFailed()
+                    onResult(false)
+                }
+            })
+
+        val promptInfo = BiometricPrompt.PromptInfo.Builder()
+            .setTitle(title)
+            .setSubtitle(subtitle)
+            .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.DEVICE_CREDENTIAL)
+            .build()
+
+        biometricPrompt.authenticate(promptInfo)
+    }
+}
+
+@Composable
+fun LockedScreen(onUnlockClick: () -> Unit) {
+    Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+        Column(
+            modifier = Modifier.fillMaxSize(),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Icon(
+                imageVector = Icons.Default.Lock,
+                contentDescription = "Locked",
+                modifier = Modifier.size(64.dp),
+                tint = MaterialTheme.colorScheme.primary
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            Text("App Locked", style = MaterialTheme.typography.headlineMedium)
+            Spacer(modifier = Modifier.height(24.dp))
+            Button(onClick = onUnlockClick) {
+                Text("Unlock")
+            }
+        }
+    }
+}
+
+@Composable
+fun OtpApp(
+    repository: AccountRepository, 
+    settingsManager: SettingsManager,
+    authenticator: (String, String, (Boolean) -> Unit) -> Unit
+) {
+    var accounts by remember { mutableStateOf<List<Account>>(emptyList()) }
+    var currentScreen by rememberSaveable { mutableStateOf("home") }
+    var progress by remember { mutableFloatStateOf(1f) }
+    
+    // --- Google Drive State ---
+    var googleAccountEmail by remember { mutableStateOf<String?>(null) }
+    var showGoogleSyncDialog by remember { mutableStateOf(false) }
+    var isCloudExporting by remember { mutableStateOf(true) }
+    var showCloudPasswordDialog by remember { mutableStateOf(false) }
+
+    // --- Local Dialog States ---
+    var showExportTypeDialog by remember { mutableStateOf(false) }
+    var showImportTypeDialog by remember { mutableStateOf(false) }
+    var showFileExportPasswordDialog by remember { mutableStateOf(false) }
+    var showFileImportPasswordDialog by remember { mutableStateOf(false) }
+    
+    var pendingFileUri by remember { mutableStateOf<Uri?>(null) }
+    
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+    val currentThemeMode by settingsManager.themeMode.collectAsState()
+    val isPrivacyEnabled by settingsManager.isPrivacyEnabled.collectAsState()
+
+    // --- File Launchers ---
+    val exportFileLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        uri?.let { 
+             pendingFileUri = it
+             showFileExportPasswordDialog = true 
+        }
+    }
+    
+    val importFileLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        uri?.let {
+            pendingFileUri = it
+            showFileImportPasswordDialog = true
+        }
+    }
+
+    // Google Sign-In Launcher (DEBUG VERSION)
+    val googleSignInLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode == android.app.Activity.RESULT_OK) {
+            val task = GoogleSignIn.getSignedInAccountFromIntent(result.data)
+            try {
+                val account = task.getResult(ApiException::class.java)
+                googleAccountEmail = account.email
+                Toast.makeText(context, "Connected: ${account.email}", Toast.LENGTH_SHORT).show()
+            } catch (e: ApiException) {
+                Log.e("GoogleSignIn", "Sign-in failed code: ${e.statusCode}", e)
+                Toast.makeText(context, "Error: ${e.statusCode} (Check Logs)", Toast.LENGTH_LONG).show()
+            }
+        } else {
+            // If the window closes immediately, this usually triggers
+            Toast.makeText(context, "Sign-In Cancelled or Failed", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // --- Initialization ---
+    LaunchedEffect(Unit) {
+        // Load Accounts
+        withContext(Dispatchers.IO) {
+            val loaded = repository.loadAccounts()
+            withContext(Dispatchers.Main) { accounts = loaded }
+        }
+        
+        // Check Google Sign-In
+        val signedInAccount = GoogleDriveHelper.getSignedInAccount(context)
+        if (signedInAccount != null) {
+            googleAccountEmail = signedInAccount.email
+        }
+
+        // Progress Timer
+        while (true) {
+            progress = TotpEngine.getProgress()
+            delay(100)
+        }
+    }
+
+    fun navigateTo(screen: String) { currentScreen = screen }
+
+    BackHandler(enabled = currentScreen != "home") {
+        navigateTo("home")
+    }
+
+    // --- Account Operations ---
+    fun addAccount(acc: Account) {
+        if (accounts.any { it.secret == acc.secret }) {
+            Toast.makeText(context, "Account already exists!", Toast.LENGTH_SHORT).show()
+            return 
+        }
+        val newList = accounts + acc
+        accounts = newList
+        scope.launch { repository.saveAccounts(newList) }
+        Toast.makeText(context, "Account Added", Toast.LENGTH_SHORT).show()
+        navigateTo("home")
+    }
+    
+    fun addBatchAccounts(newAccounts: List<Account>) {
+        var addedCount = 0
+        val currentList = accounts.toMutableList()
+        newAccounts.forEach { acc ->
+            if (currentList.none { it.secret == acc.secret }) {
+                currentList.add(acc)
+                addedCount++
+            }
+        }
+        if (addedCount > 0) {
+            accounts = currentList
+            scope.launch { repository.saveAccounts(currentList) }
+            Toast.makeText(context, "Imported $addedCount accounts", Toast.LENGTH_LONG).show()
+            navigateTo("home")
+        } else {
+            Toast.makeText(context, "All accounts already exist!", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    fun deleteAccount(acc: Account) {
+        if (isPrivacyEnabled) {
+            authenticator("Confirm Deletion", "Verify identity to delete account") { success ->
+                if (success) {
+                    val newList = accounts - acc
+                    accounts = newList
+                    scope.launch { repository.saveAccounts(newList) }
+                    Toast.makeText(context, "Account Deleted", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(context, "Authentication Failed", Toast.LENGTH_SHORT).show()
+                }
+            }
+        } else {
+            val newList = accounts - acc
+            accounts = newList
+            scope.launch { repository.saveAccounts(newList) }
+            Toast.makeText(context, "Account Deleted", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // --- UI Layout ---
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text(when (currentScreen) {
+                    "home" -> "Authenticator"
+                    "settings" -> "Settings"
+                    "about" -> "About"
+                    "export_qr" -> "Export QR"
+                    else -> "Back"
+                }) },
+                navigationIcon = {
+                    if (currentScreen != "home") {
+                        IconButton(onClick = { navigateTo("home") }) { Icon(Icons.Default.ArrowBack, "Back") }
+                    }
+                },
+                actions = {
+                    if (currentScreen == "home") {
+                        IconButton(onClick = { navigateTo("settings") }) { Icon(Icons.Default.Settings, "Settings") }
+                        IconButton(onClick = { navigateTo("about") }) { Icon(Icons.Default.Info, "About") }
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer,
+                    titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                )
+            )
+        },
+        floatingActionButton = {
+            if (currentScreen == "home") {
+                Column(horizontalAlignment = Alignment.End) {
+                    SmallFloatingActionButton(
+                        onClick = { navigateTo("manual") },
+                        containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                        modifier = Modifier.padding(bottom = 16.dp)
+                    ) { Icon(Icons.Default.Keyboard, "Manual") }
+                    FloatingActionButton(onClick = { navigateTo("scan") }) { Icon(Icons.Default.QrCodeScanner, "Scan") }
+                }
+            }
+        }
+    ) { padding ->
+        AnimatedContent(
+            targetState = currentScreen,
+            transitionSpec = {
+                 if (targetState == "home" || (initialState == "manual" && targetState == "home")) {
+                    slideInHorizontally { -it } + fadeIn() togetherWith slideOutHorizontally { it } + fadeOut()
+                } else {
+                    slideInHorizontally { it } + fadeIn() togetherWith slideOutHorizontally { -it } + fadeOut()
+                }
+            },
+            label = "ScreenTransition",
+            modifier = Modifier.padding(padding).fillMaxSize()
+        ) { targetScreen ->
+            when (targetScreen) {
+                "home" -> HomeScreen(accounts, progress, ::deleteAccount)
+                "scan" -> ScanScreen(onCodeFound = { url ->
+                    try {
+                        Log.d("QR_SCANNER", "QR Code detected: $url")
+                        
+                        if (url.startsWith("otpauth-migration://")) {
+                             val migrated = GoogleAuthMigration.parseMigrationUri(url)
+                             if (migrated.isNotEmpty()) {
+                                 addBatchAccounts(migrated)
+                             } else {
+                                 Toast.makeText(context, "Empty Migration QR", Toast.LENGTH_SHORT).show()
+                             }
+                             return@ScanScreen
+                        }
+
+                        val parsedAccount = parseQrContent(url, context)
+                        if (parsedAccount != null) {
+                            addAccount(parsedAccount)
+                        } else {
+                            Toast.makeText(context, "Unsupported QR format", Toast.LENGTH_SHORT).show()
+                        }
+                    } catch (e: Exception) {
+                        Log.e("QR_PROCESSING", "Error processing QR", e)
+                        Toast.makeText(context, "Invalid QR code", Toast.LENGTH_SHORT).show()
+                    }
+                })
+                "manual" -> ManualEntryScreen(onSave = { i, l, s -> addAccount(Account(issuer = i, label = l, secret = s)) })
+                "about" -> AboutScreen()
+                "settings" -> SettingsScreen(
+                    currentMode = currentThemeMode,
+                    isPrivacyEnabled = isPrivacyEnabled,
+                    googleAccountEmail = googleAccountEmail, // PASS EMAIL
+                    onModeSelected = { settingsManager.setThemeMode(it) },
+                    onPrivacyToggle = { settingsManager.setPrivacyEnabled(it) },
+                    onExportClick = { showExportTypeDialog = true }, 
+                    onImportClick = { showImportTypeDialog = true },
+                    onGoogleConnect = {
+                        val signInClient = GoogleDriveHelper.getSignInClient(context)
+                        googleSignInLauncher.launch(signInClient.signInIntent)
+                    },
+                    onGoogleSync = { showGoogleSyncDialog = true }
+                )
+                "export_qr" -> ExportScreen(
+                    accounts = accounts,
+                    onClose = { navigateTo("settings") }
+                )
+            }
+        }
+        
+        // --- DIALOGS ---
+
+        // 1. Google Drive Sync Choice
+        if (showGoogleSyncDialog) {
+            AlertDialog(
+                onDismissRequest = { showGoogleSyncDialog = false },
+                title = { Text("Google Drive Sync") },
+                text = { Text("Securely backup or restore using Google Drive (Encrypted).\n\nYou will need to set a password.") },
+                confirmButton = {
+                    Button(onClick = { 
+                        showGoogleSyncDialog = false
+                        isCloudExporting = true
+                        showCloudPasswordDialog = true
+                    }) { Text("Backup (Encrypt)") }
+                },
+                dismissButton = {
+                    OutlinedButton(onClick = { 
+                        showGoogleSyncDialog = false
+                        isCloudExporting = false
+                        showCloudPasswordDialog = true
+                    }) { Text("Restore (Decrypt)") }
+                }
+            )
+        }
+
+        // 2. Cloud Password Dialog (Triggers Upload/Download)
+        if (showCloudPasswordDialog) {
+            PasswordDialog(
+                title = if (isCloudExporting) "Encrypt Backup" else "Decrypt Backup",
+                onDismiss = { showCloudPasswordDialog = false },
+                onConfirm = { password ->
+                    showCloudPasswordDialog = false
+                    val account = GoogleDriveHelper.getSignedInAccount(context)
+                    if (account != null) {
+                        scope.launch(Dispatchers.IO) {
+                            try {
+                                if (isCloudExporting) {
+                                    // ENCRYPT & UPLOAD
+                                    val stream = ByteArrayOutputStream()
+                                    BackupHelper.exportAccounts(accounts, password, stream)
+                                    val encryptedBytes = stream.toByteArray()
+                                    
+                                    GoogleDriveHelper.uploadBackup(context, account, encryptedBytes)
+                                    
+                                    withContext(Dispatchers.Main) { Toast.makeText(context, "Encrypted Backup Uploaded!", Toast.LENGTH_LONG).show() }
+                                } else {
+                                    // DOWNLOAD & DECRYPT
+                                    val encryptedBytes = GoogleDriveHelper.downloadBackup(context, account)
+                                    
+                                    if (encryptedBytes != null) {
+                                        val stream = ByteArrayInputStream(encryptedBytes)
+                                        val imported = BackupHelper.importAccounts(password, stream)
+                                        withContext(Dispatchers.Main) { addBatchAccounts(imported) }
+                                    } else {
+                                        withContext(Dispatchers.Main) { Toast.makeText(context, "No backup found", Toast.LENGTH_SHORT).show() }
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                withContext(Dispatchers.Main) { Toast.makeText(context, "Failed: ${e.message}", Toast.LENGTH_LONG).show() }
+                            }
+                        }
+                    }
+                }
+            )
+        }
+
+        // 3. Local Export/Import Dialogs
+        if (showExportTypeDialog) {
+            AlertDialog(
+                onDismissRequest = { showExportTypeDialog = false },
+                title = { Text("Export Options") },
+                text = { Text("How would you like to export your accounts?") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        showExportTypeDialog = false
+                        navigateTo("export_qr") 
+                    }) { Text("Show QR Code") }
+                },
+                dismissButton = {
+                    TextButton(onClick = {
+                        showExportTypeDialog = false
+                        exportFileLauncher.launch("otp_backup.json")
+                    }) { Text("Save to File") }
+                }
+            )
+        }
+
+        if (showImportTypeDialog) {
+            AlertDialog(
+                onDismissRequest = { showImportTypeDialog = false },
+                title = { Text("Import Options") },
+                text = { Text("How would you like to import accounts?") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        showImportTypeDialog = false
+                        navigateTo("scan")
+                    }) { Text("Scan QR Code") }
+                },
+                dismissButton = {
+                    TextButton(onClick = {
+                        showImportTypeDialog = false
+                        importFileLauncher.launch("application/json")
+                    }) { Text("Read from File") }
+                }
+            )
+        }
+
+        if (showFileExportPasswordDialog && pendingFileUri != null) {
+            PasswordDialog(title = "Encrypt Backup", onDismiss = { showFileExportPasswordDialog = false }, onConfirm = { password ->
+                showFileExportPasswordDialog = false
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        context.contentResolver.openOutputStream(pendingFileUri!!)?.use { output ->
+                            BackupHelper.exportAccounts(accounts, password, output)
+                        }
+                        withContext(Dispatchers.Main) { Toast.makeText(context, "Export Successful", Toast.LENGTH_LONG).show() }
+                    } catch (e: Exception) {
+                        withContext(Dispatchers.Main) { Toast.makeText(context, "Export Failed: ${e.message}", Toast.LENGTH_LONG).show() }
+                    }
+                }
+            })
+        }
+
+        if (showFileImportPasswordDialog && pendingFileUri != null) {
+             PasswordDialog(title = "Decrypt Backup", onDismiss = { showFileImportPasswordDialog = false }, onConfirm = { password ->
+                showFileImportPasswordDialog = false
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        context.contentResolver.openInputStream(pendingFileUri!!)?.use { input ->
+                            val imported = BackupHelper.importAccounts(password, input)
+                            withContext(Dispatchers.Main) { addBatchAccounts(imported) }
+                        }
+                    } catch (e: Exception) {
+                        withContext(Dispatchers.Main) { Toast.makeText(context, "Import Failed: Wrong Password?", Toast.LENGTH_LONG).show() }
+                    }
+                }
+            })
+        }
+    }
+}
+
+/**
+ * Parse QR code content and extract OTP account information
+ */
+private fun parseQrContent(url: String, context: android.content.Context): Account? {
+    return try {
+        // Check standard otpauth URI
+        if (url.startsWith("otpauth://")) {
+            val uri = Uri.parse(url)
+            if (uri.host == "totp") {
+                val secret = uri.getQueryParameter("secret")
+                val issuer = uri.getQueryParameter("issuer") ?: "Unknown"
+                val label = uri.path?.trim('/') ?: "Account"
+                if (secret != null) {
+                    return Account(issuer = issuer, label = label, secret = secret)
+                }
+            }
+        }
+        
+        // Check plain Base32 secret
+        if (isValidBase32(url)) {
+            return Account(issuer = "QR Code", label = "Imported Account", secret = url)
+        }
+        
+        // Extract from URL params
+        extractFromUrlParams(url)
+    } catch (e: Exception) {
+        null
+    }
+}
+
+private fun isValidBase32(input: String): Boolean {
+    val clean = input.trim().uppercase()
+    val pattern = Pattern.compile("^[A-Z2-7]+=*$")
+    return pattern.matcher(clean).matches() && clean.length in 16..32
+}
+
+private fun extractFromUrlParams(url: String): Account? {
+    return try {
+        val secretRegex = Regex("secret=([A-Z2-7]+)", RegexOption.IGNORE_CASE)
+        val secretMatch = secretRegex.find(url)
+        
+        if (secretMatch != null) {
+            val secret = secretMatch.groupValues[1]
+            val issuerRegex = Regex("issuer=([^&]+)", RegexOption.IGNORE_CASE)
+            val issuerMatch = issuerRegex.find(url)
+            val issuer = issuerMatch?.groupValues?.get(1) ?: "Unknown"
+            
+            val labelRegex = Regex("/([^?]+)\\?")
+            val labelMatch = labelRegex.find(url)
+            val label = labelMatch?.groupValues?.get(1) ?: "Account"
+            
+            return Account(issuer = issuer, label = label, secret = secret)
+        }
+        null
+    } catch (e: Exception) {
+        null
+    }
+}
+
+@Composable
+fun PasswordDialog(title: String, onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
+    var password by remember { mutableStateOf("") }
+    
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column {
+                Text("Enter encryption password:")
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    label = { Text("Password") },
+                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { if (password.isNotEmpty()) onConfirm(password) },
+                enabled = password.isNotEmpty()
+            ) { Text("Confirm") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
+}
+--- End of MainActivity.kt ---
+
+├── crypto
+│   ├── Base32.kt
+
+--- File: crypto\Base32.kt ---
+package com.otp.auth.crypto
+
+object Base32 {
+
+    private const val ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+    private val LOOKUP = IntArray(256) { -1 }.apply {
+        for (i in ALPHABET.indices) {
+            this[ALPHABET[i].code] = i
+        }
+    }
+
+    /* =======================
+       ======= DECODE =========
+       ======================= */
+
+    fun decode(encoded: String): ByteArray {
+        val clean = encoded
+            .trim()
+            .replace("-", "")
+            .replace(" ", "")
+            .uppercase()
+            .trimEnd('=')
+
+        if (clean.isEmpty()) return ByteArray(0)
+
+        val out = ByteArray(clean.length * 5 / 8)
+        var buffer = 0
+        var bitsLeft = 0
+        var index = 0
+
+        for (c in clean) {
+            val value = if (c.code < 256) LOOKUP[c.code] else -1
+            require(value >= 0) { "Invalid Base32 character: $c" }
+
+            buffer = (buffer shl 5) or value
+            bitsLeft += 5
+
+            if (bitsLeft >= 8) {
+                out[index++] = ((buffer shr (bitsLeft - 8)) and 0xFF).toByte()
+                bitsLeft -= 8
+            }
+        }
+
+        return if (index == out.size) out else out.copyOf(index)
+    }
+
+    /* =======================
+       ======= ENCODE =========
+       ======================= */
+
+    fun encode(bytes: ByteArray): String {
+        if (bytes.isEmpty()) return ""
+
+        val out = StringBuilder((bytes.size * 8 + 4) / 5)
+        var buffer = 0
+        var bitsLeft = 0
+
+        for (b in bytes) {
+            buffer = (buffer shl 8) or (b.toInt() and 0xFF)
+            bitsLeft += 8
+
+            while (bitsLeft >= 5) {
+                out.append(ALPHABET[(buffer shr (bitsLeft - 5)) and 31])
+                bitsLeft -= 5
+            }
+        }
+
+        if (bitsLeft > 0) {
+            out.append(ALPHABET[(buffer shl (5 - bitsLeft)) and 31])
+        }
+
+        return out.toString()
+    }
+}
+
+--- End of crypto\Base32.kt ---
+
+│   └── TotpEngine.kt
+
+--- File: crypto\TotpEngine.kt ---
+package com.otp.auth.crypto
+
+import java.nio.ByteBuffer
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
+
+object TotpEngine {
+    private const val ALGORITHM = "HmacSHA1"
+    private const val PERIOD = 30L
+
+    fun generateNow(secret: String): String {
+        return try {
+            val keyBytes = Base32.decode(secret)
+            val time = System.currentTimeMillis() / 1000 / PERIOD
+            generateTOTP(keyBytes, time)
+        } catch (e: Exception) {
+            "000000"
+        }
+    }
+
+    fun getProgress(): Float {
+        val time = System.currentTimeMillis() / 1000.0
+        val remaining = PERIOD - (time % PERIOD)
+        return (remaining / PERIOD).toFloat()
+    }
+
+    private fun generateTOTP(key: ByteArray, time: Long): String {
+        val msg = ByteBuffer.allocate(8).putLong(time).array()
+        val hmac = Mac.getInstance(ALGORITHM)
+        hmac.init(SecretKeySpec(key, ALGORITHM))
+        val hash = hmac.doFinal(msg)
+
+        val offset = hash[hash.size - 1].toInt() and 0xf
+        val binary = ((hash[offset].toInt() and 0x7f) shl 24) or
+                ((hash[offset + 1].toInt() and 0xff) shl 16) or
+                ((hash[offset + 2].toInt() and 0xff) shl 8) or
+                (hash[offset + 3].toInt() and 0xff)
+
+        val otp = binary % 1_000_000
+        return String.format("%06d", otp)
+    }
+}
+--- End of crypto\TotpEngine.kt ---
+
+├── data
+│   ├── Account.kt
+
+--- File: data\Account.kt ---
+package com.otp.auth.data
+
+data class Account(
+    val id: String = java.util.UUID.randomUUID().toString(),
+    val issuer: String,
+    val label: String,
+    val secret: String
+)
+--- End of data\Account.kt ---
+
+│   ├── AccountRepository.kt
+
+--- File: data\AccountRepository.kt ---
+package com.otp.auth.data
+
+import android.content.Context
+import android.content.SharedPreferences
+import android.util.Log
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
+class AccountRepository(context: Context) {
+    private val gson = Gson()
+    private val sharedPreferences: SharedPreferences
+
+    init {
+        // 1. Create the Master Key (Stored in Android Keystore)
+        val masterKey = MasterKey.Builder(context)
+            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+            .build()
+
+        // 2. Open Encrypted Preferences
+        // This looks like normal SharedPreferences but encrypts everything automatically.
+        sharedPreferences = EncryptedSharedPreferences.create(
+            context,
+            "secure_otp_accounts", // File name
+            masterKey,
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+        )
+    }
+
+    suspend fun saveAccounts(accounts: List<Account>) = withContext(Dispatchers.IO) {
+        try {
+            // Convert List -> JSON
+            val json = gson.toJson(accounts)
+            
+            // Save (Encryption happens automatically)
+            sharedPreferences.edit()
+                .putString("accounts_data", json)
+                .commit() // Commit ensures it writes to disk immediately
+                
+            Log.d("AccountRepo", "Saved ${accounts.size} accounts securely.")
+        } catch (e: Exception) {
+            Log.e("AccountRepo", "Save Failed", e)
+        }
+    }
+
+    suspend fun loadAccounts(): List<Account> = withContext(Dispatchers.IO) {
+        try {
+            // Load (Decryption happens automatically)
+            val json = sharedPreferences.getString("accounts_data", null)
+            
+            if (json.isNullOrEmpty()) {
+                return@withContext emptyList()
+            }
+
+            // Convert JSON -> List
+            val type = object : TypeToken<List<Account>>() {}.type
+            val list: List<Account> = gson.fromJson(json, type) ?: emptyList()
+            
+            Log.d("AccountRepo", "Loaded ${list.size} accounts.")
+            return@withContext list
+        } catch (e: Exception) {
+            Log.e("AccountRepo", "Load Failed", e)
+            return@withContext emptyList()
+        }
+    }
+}
+--- End of data\AccountRepository.kt ---
+
+│   └── SettingsManager.kt
+
+--- File: data\SettingsManager.kt ---
+package com.otp.auth.data
+
+import android.content.Context
+import android.content.SharedPreferences
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+enum class AppThemeMode {
+    SYSTEM, LIGHT, DARK
+}
+
+class SettingsManager(context: Context) {
+    private val prefs: SharedPreferences = context.getSharedPreferences("otp_settings", Context.MODE_PRIVATE)
+    
+    // Theme State
+    private val _themeMode = MutableStateFlow(loadThemeMode())
+    val themeMode: StateFlow<AppThemeMode> = _themeMode.asStateFlow()
+
+    // Privacy State
+    private val _isPrivacyEnabled = MutableStateFlow(prefs.getBoolean("privacy_enabled", false))
+    val isPrivacyEnabled: StateFlow<Boolean> = _isPrivacyEnabled.asStateFlow()
+
+    fun setThemeMode(mode: AppThemeMode) {
+        prefs.edit().putString("theme_mode", mode.name).apply()
+        _themeMode.value = mode
+    }
+
+    fun setPrivacyEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("privacy_enabled", enabled).apply()
+        _isPrivacyEnabled.value = enabled
+    }
+
+    private fun loadThemeMode(): AppThemeMode {
+        val savedName = prefs.getString("theme_mode", AppThemeMode.SYSTEM.name)
+        return try {
+            AppThemeMode.valueOf(savedName ?: AppThemeMode.SYSTEM.name)
+        } catch (e: Exception) {
+            AppThemeMode.SYSTEM
+        }
+    }
+}
+--- End of data\SettingsManager.kt ---
+
+├── print_file.py
+├── project_dump.txt
+
+--- File: project_dump.txt ---
+Project Structure and File Contents:
+
+├── MainActivity.kt
+
+--- File: MainActivity.kt ---
+@file:OptIn(ExperimentalMaterial3Api::class, ExperimentalAnimationApi::class)
+
+package com.otp.auth
+
+import android.net.Uri
+import android.os.Bundle
+import android.util.Log
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.biometric.BiometricManager
+import androidx.biometric.BiometricPrompt
+import androidx.compose.animation.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.google.android.gms.auth.api.signin.GoogleSignIn
+import com.google.android.gms.common.api.ApiException
+import com.otp.auth.crypto.TotpEngine
+import com.otp.auth.data.Account
+import com.otp.auth.data.AccountRepository
+import com.otp.auth.data.SettingsManager
+import com.otp.auth.ui.*
+import com.otp.auth.ui.theme.OtpAuthTheme
+import com.otp.auth.utils.BackupHelper
+import com.otp.auth.utils.GoogleAuthMigration
+import com.otp.auth.utils.GoogleDriveHelper
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.util.regex.Pattern
+
+class MainActivity : FragmentActivity() {
+    
+    private lateinit var settingsManager: SettingsManager
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val repository = AccountRepository(this)
+        settingsManager = SettingsManager(this)
+
+        setContent {
+            val themeMode by settingsManager.themeMode.collectAsState()
+            val isPrivacyEnabled by settingsManager.isPrivacyEnabled.collectAsState()
+            
+            var isUnlocked by remember { mutableStateOf(!isPrivacyEnabled) }
+            
+            val lifecycleOwner = LocalLifecycleOwner.current
+            DisposableEffect(lifecycleOwner) {
+                val observer = LifecycleEventObserver { _, event ->
+                    if (event == Lifecycle.Event.ON_START) {
+                        if (settingsManager.isPrivacyEnabled.value) {
+                            isUnlocked = false
+                        }
+                    }
+                }
+                lifecycleOwner.lifecycle.addObserver(observer)
+                onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+            }
+
+            LaunchedEffect(isUnlocked, isPrivacyEnabled) {
+                if (isPrivacyEnabled && !isUnlocked) {
+                    authenticateUser(
+                        title = "Unlock App",
+                        subtitle = "Use Biometrics to access accounts"
+                    ) { success -> isUnlocked = success }
+                } else if (!isPrivacyEnabled) {
+                    isUnlocked = true
+                }
+            }
+
+            OtpAuthTheme(themeMode = themeMode) {
+                if (isUnlocked) {
+                    OtpApp(repository, settingsManager, ::authenticateUser)
+                } else {
+                    LockedScreen(onUnlockClick = {
+                         authenticateUser(
+                             title = "Unlock App",
+                             subtitle = "Use Biometrics to access accounts"
+                         ) { success -> isUnlocked = success }
+                    })
+                }
+            }
+        }
+    }
+
+    private fun authenticateUser(
+        title: String = "Authentication Required", 
+        subtitle: String = "Verify your identity", 
+        onResult: (Boolean) -> Unit
+    ) {
+        val executor = ContextCompat.getMainExecutor(this)
+        val biometricPrompt = BiometricPrompt(this, executor,
+            object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                    super.onAuthenticationSucceeded(result)
+                    onResult(true)
+                }
+                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                    super.onAuthenticationError(errorCode, errString)
+                    onResult(false)
+                }
+                override fun onAuthenticationFailed() {
+                    super.onAuthenticationFailed()
+                    onResult(false)
+                }
+            })
+
+        val promptInfo = BiometricPrompt.PromptInfo.Builder()
+            .setTitle(title)
+            .setSubtitle(subtitle)
+            .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.DEVICE_CREDENTIAL)
+            .build()
+
+        biometricPrompt.authenticate(promptInfo)
+    }
+}
+
+@Composable
+fun LockedScreen(onUnlockClick: () -> Unit) {
+    Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+        Column(
+            modifier = Modifier.fillMaxSize(),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Icon(
+                imageVector = Icons.Default.Lock,
+                contentDescription = "Locked",
+                modifier = Modifier.size(64.dp),
+                tint = MaterialTheme.colorScheme.primary
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            Text("App Locked", style = MaterialTheme.typography.headlineMedium)
+            Spacer(modifier = Modifier.height(24.dp))
+            Button(onClick = onUnlockClick) {
+                Text("Unlock")
+            }
+        }
+    }
+}
+
+@Composable
+fun OtpApp(
+    repository: AccountRepository, 
+    settingsManager: SettingsManager,
+    authenticator: (String, String, (Boolean) -> Unit) -> Unit
+) {
+    var accounts by remember { mutableStateOf<List<Account>>(emptyList()) }
+    var currentScreen by rememberSaveable { mutableStateOf("home") }
+    var progress by remember { mutableFloatStateOf(1f) }
+    
+    // --- Google Drive State ---
+    var googleAccountEmail by remember { mutableStateOf<String?>(null) }
+    var showGoogleSyncDialog by remember { mutableStateOf(false) }
+    var isCloudExporting by remember { mutableStateOf(true) }
+    var showCloudPasswordDialog by remember { mutableStateOf(false) }
+
+    // --- Local Dialog States ---
+    var showExportTypeDialog by remember { mutableStateOf(false) }
+    var showImportTypeDialog by remember { mutableStateOf(false) }
+    var showFileExportPasswordDialog by remember { mutableStateOf(false) }
+    var showFileImportPasswordDialog by remember { mutableStateOf(false) }
+    
+    var pendingFileUri by remember { mutableStateOf<Uri?>(null) }
+    
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+    val currentThemeMode by settingsManager.themeMode.collectAsState()
+    val isPrivacyEnabled by settingsManager.isPrivacyEnabled.collectAsState()
+
+    // --- File Launchers ---
+    val exportFileLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        uri?.let { 
+             pendingFileUri = it
+             showFileExportPasswordDialog = true 
+        }
+    }
+    
+    val importFileLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        uri?.let {
+            pendingFileUri = it
+            showFileImportPasswordDialog = true
+        }
+    }
+
+    // Google Sign-In Launcher (DEBUG VERSION)
+    val googleSignInLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode == android.app.Activity.RESULT_OK) {
+            val task = GoogleSignIn.getSignedInAccountFromIntent(result.data)
+            try {
+                val account = task.getResult(ApiException::class.java)
+                googleAccountEmail = account.email
+                Toast.makeText(context, "Connected: ${account.email}", Toast.LENGTH_SHORT).show()
+            } catch (e: ApiException) {
+                Log.e("GoogleSignIn", "Sign-in failed code: ${e.statusCode}", e)
+                Toast.makeText(context, "Error: ${e.statusCode} (Check Logs)", Toast.LENGTH_LONG).show()
+            }
+        } else {
+            // If the window closes immediately, this usually triggers
+            Toast.makeText(context, "Sign-In Cancelled or Failed", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // --- Initialization ---
+    LaunchedEffect(Unit) {
+        // Load Accounts
+        withContext(Dispatchers.IO) {
+            val loaded = repository.loadAccounts()
+            withContext(Dispatchers.Main) { accounts = loaded }
+        }
+        
+        // Check Google Sign-In
+        val signedInAccount = GoogleDriveHelper.getSignedInAccount(context)
+        if (signedInAccount != null) {
+            googleAccountEmail = signedInAccount.email
+        }
+
+        // Progress Timer
+        while (true) {
+            progress = TotpEngine.getProgress()
+            delay(100)
+        }
+    }
+
+    fun navigateTo(screen: String) { currentScreen = screen }
+
+    BackHandler(enabled = currentScreen != "home") {
+        navigateTo("home")
+    }
+
+    // --- Account Operations ---
+    fun addAccount(acc: Account) {
+        if (accounts.any { it.secret == acc.secret }) {
+            Toast.makeText(context, "Account already exists!", Toast.LENGTH_SHORT).show()
+            return 
+        }
+        val newList = accounts + acc
+        accounts = newList
+        scope.launch { repository.saveAccounts(newList) }
+        Toast.makeText(context, "Account Added", Toast.LENGTH_SHORT).show()
+        navigateTo("home")
+    }
+    
+    fun addBatchAccounts(newAccounts: List<Account>) {
+        var addedCount = 0
+        val currentList = accounts.toMutableList()
+        newAccounts.forEach { acc ->
+            if (currentList.none { it.secret == acc.secret }) {
+                currentList.add(acc)
+                addedCount++
+            }
+        }
+        if (addedCount > 0) {
+            accounts = currentList
+            scope.launch { repository.saveAccounts(currentList) }
+            Toast.makeText(context, "Imported $addedCount accounts", Toast.LENGTH_LONG).show()
+            navigateTo("home")
+        } else {
+            Toast.makeText(context, "All accounts already exist!", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    fun deleteAccount(acc: Account) {
+        if (isPrivacyEnabled) {
+            authenticator("Confirm Deletion", "Verify identity to delete account") { success ->
+                if (success) {
+                    val newList = accounts - acc
+                    accounts = newList
+                    scope.launch { repository.saveAccounts(newList) }
+                    Toast.makeText(context, "Account Deleted", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(context, "Authentication Failed", Toast.LENGTH_SHORT).show()
+                }
+            }
+        } else {
+            val newList = accounts - acc
+            accounts = newList
+            scope.launch { repository.saveAccounts(newList) }
+            Toast.makeText(context, "Account Deleted", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // --- UI Layout ---
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text(when (currentScreen) {
+                    "home" -> "Authenticator"
+                    "settings" -> "Settings"
+                    "about" -> "About"
+                    "export_qr" -> "Export QR"
+                    else -> "Back"
+                }) },
+                navigationIcon = {
+                    if (currentScreen != "home") {
+                        IconButton(onClick = { navigateTo("home") }) { Icon(Icons.Default.ArrowBack, "Back") }
+                    }
+                },
+                actions = {
+                    if (currentScreen == "home") {
+                        IconButton(onClick = { navigateTo("settings") }) { Icon(Icons.Default.Settings, "Settings") }
+                        IconButton(onClick = { navigateTo("about") }) { Icon(Icons.Default.Info, "About") }
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer,
+                    titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                )
+            )
+        },
+        floatingActionButton = {
+            if (currentScreen == "home") {
+                Column(horizontalAlignment = Alignment.End) {
+                    SmallFloatingActionButton(
+                        onClick = { navigateTo("manual") },
+                        containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                        modifier = Modifier.padding(bottom = 16.dp)
+                    ) { Icon(Icons.Default.Keyboard, "Manual") }
+                    FloatingActionButton(onClick = { navigateTo("scan") }) { Icon(Icons.Default.QrCodeScanner, "Scan") }
+                }
+            }
+        }
+    ) { padding ->
+        AnimatedContent(
+            targetState = currentScreen,
+            transitionSpec = {
+                 if (targetState == "home" || (initialState == "manual" && targetState == "home")) {
+                    slideInHorizontally { -it } + fadeIn() togetherWith slideOutHorizontally { it } + fadeOut()
+                } else {
+                    slideInHorizontally { it } + fadeIn() togetherWith slideOutHorizontally { -it } + fadeOut()
+                }
+            },
+            label = "ScreenTransition",
+            modifier = Modifier.padding(padding).fillMaxSize()
+        ) { targetScreen ->
+            when (targetScreen) {
+                "home" -> HomeScreen(accounts, progress, ::deleteAccount)
+                "scan" -> ScanScreen(onCodeFound = { url ->
+                    try {
+                        Log.d("QR_SCANNER", "QR Code detected: $url")
+                        
+                        if (url.startsWith("otpauth-migration://")) {
+                             val migrated = GoogleAuthMigration.parseMigrationUri(url)
+                             if (migrated.isNotEmpty()) {
+                                 addBatchAccounts(migrated)
+                             } else {
+                                 Toast.makeText(context, "Empty Migration QR", Toast.LENGTH_SHORT).show()
+                             }
+                             return@ScanScreen
+                        }
+
+                        val parsedAccount = parseQrContent(url, context)
+                        if (parsedAccount != null) {
+                            addAccount(parsedAccount)
+                        } else {
+                            Toast.makeText(context, "Unsupported QR format", Toast.LENGTH_SHORT).show()
+                        }
+                    } catch (e: Exception) {
+                        Log.e("QR_PROCESSING", "Error processing QR", e)
+                        Toast.makeText(context, "Invalid QR code", Toast.LENGTH_SHORT).show()
+                    }
+                })
+                "manual" -> ManualEntryScreen(onSave = { i, l, s -> addAccount(Account(issuer = i, label = l, secret = s)) })
+                "about" -> AboutScreen()
+                "settings" -> SettingsScreen(
+                    currentMode = currentThemeMode,
+                    isPrivacyEnabled = isPrivacyEnabled,
+                    googleAccountEmail = googleAccountEmail, // PASS EMAIL
+                    onModeSelected = { settingsManager.setThemeMode(it) },
+                    onPrivacyToggle = { settingsManager.setPrivacyEnabled(it) },
+                    onExportClick = { showExportTypeDialog = true }, 
+                    onImportClick = { showImportTypeDialog = true },
+                    onGoogleConnect = {
+                        val signInClient = GoogleDriveHelper.getSignInClient(context)
+                        googleSignInLauncher.launch(signInClient.signInIntent)
+                    },
+                    onGoogleSync = { showGoogleSyncDialog = true }
+                )
+                "export_qr" -> ExportScreen(
+                    accounts = accounts,
+                    onClose = { navigateTo("settings") }
+                )
+            }
+        }
+        
+        // --- DIALOGS ---
+
+        // 1. Google Drive Sync Choice
+        if (showGoogleSyncDialog) {
+            AlertDialog(
+                onDismissRequest = { showGoogleSyncDialog = false },
+                title = { Text("Google Drive Sync") },
+                text = { Text("Securely backup or restore using Google Drive (Encrypted).\n\nYou will need to set a password.") },
+                confirmButton = {
+                    Button(onClick = { 
+                        showGoogleSyncDialog = false
+                        isCloudExporting = true
+                        showCloudPasswordDialog = true
+                    }) { Text("Backup (Encrypt)") }
+                },
+                dismissButton = {
+                    OutlinedButton(onClick = { 
+                        showGoogleSyncDialog = false
+                        isCloudExporting = false
+                        showCloudPasswordDialog = true
+                    }) { Text("Restore (Decrypt)") }
+                }
+            )
+        }
+
+        // 2. Cloud Password Dialog (Triggers Upload/Download)
+        if (showCloudPasswordDialog) {
+            PasswordDialog(
+                title = if (isCloudExporting) "Encrypt Backup" else "Decrypt Backup",
+                onDismiss = { showCloudPasswordDialog = false },
+                onConfirm = { password ->
+                    showCloudPasswordDialog = false
+                    val account = GoogleDriveHelper.getSignedInAccount(context)
+                    if (account != null) {
+                        scope.launch(Dispatchers.IO) {
+                            try {
+                                if (isCloudExporting) {
+                                    // ENCRYPT & UPLOAD
+                                    val stream = ByteArrayOutputStream()
+                                    BackupHelper.exportAccounts(accounts, password, stream)
+                                    val encryptedBytes = stream.toByteArray()
+                                    
+                                    GoogleDriveHelper.uploadBackup(context, account, encryptedBytes)
+                                    
+                                    withContext(Dispatchers.Main) { Toast.makeText(context, "Encrypted Backup Uploaded!", Toast.LENGTH_LONG).show() }
+                                } else {
+                                    // DOWNLOAD & DECRYPT
+                                    val encryptedBytes = GoogleDriveHelper.downloadBackup(context, account)
+                                    
+                                    if (encryptedBytes != null) {
+                                        val stream = ByteArrayInputStream(encryptedBytes)
+                                        val imported = BackupHelper.importAccounts(password, stream)
+                                        withContext(Dispatchers.Main) { addBatchAccounts(imported) }
+                                    } else {
+                                        withContext(Dispatchers.Main) { Toast.makeText(context, "No backup found", Toast.LENGTH_SHORT).show() }
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                withContext(Dispatchers.Main) { Toast.makeText(context, "Failed: ${e.message}", Toast.LENGTH_LONG).show() }
+                            }
+                        }
+                    }
+                }
+            )
+        }
+
+        // 3. Local Export/Import Dialogs
+        if (showExportTypeDialog) {
+            AlertDialog(
+                onDismissRequest = { showExportTypeDialog = false },
+                title = { Text("Export Options") },
+                text = { Text("How would you like to export your accounts?") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        showExportTypeDialog = false
+                        navigateTo("export_qr") 
+                    }) { Text("Show QR Code") }
+                },
+                dismissButton = {
+                    TextButton(onClick = {
+                        showExportTypeDialog = false
+                        exportFileLauncher.launch("otp_backup.json")
+                    }) { Text("Save to File") }
+                }
+            )
+        }
+
+        if (showImportTypeDialog) {
+            AlertDialog(
+                onDismissRequest = { showImportTypeDialog = false },
+                title = { Text("Import Options") },
+                text = { Text("How would you like to import accounts?") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        showImportTypeDialog = false
+                        navigateTo("scan")
+                    }) { Text("Scan QR Code") }
+                },
+                dismissButton = {
+                    TextButton(onClick = {
+                        showImportTypeDialog = false
+                        importFileLauncher.launch("application/json")
+                    }) { Text("Read from File") }
+                }
+            )
+        }
+
+        if (showFileExportPasswordDialog && pendingFileUri != null) {
+            PasswordDialog(title = "Encrypt Backup", onDismiss = { showFileExportPasswordDialog = false }, onConfirm = { password ->
+                showFileExportPasswordDialog = false
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        context.contentResolver.openOutputStream(pendingFileUri!!)?.use { output ->
+                            BackupHelper.exportAccounts(accounts, password, output)
+                        }
+                        withContext(Dispatchers.Main) { Toast.makeText(context, "Export Successful", Toast.LENGTH_LONG).show() }
+                    } catch (e: Exception) {
+                        withContext(Dispatchers.Main) { Toast.makeText(context, "Export Failed: ${e.message}", Toast.LENGTH_LONG).show() }
+                    }
+                }
+            })
+        }
+
+        if (showFileImportPasswordDialog && pendingFileUri != null) {
+             PasswordDialog(title = "Decrypt Backup", onDismiss = { showFileImportPasswordDialog = false }, onConfirm = { password ->
+                showFileImportPasswordDialog = false
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        context.contentResolver.openInputStream(pendingFileUri!!)?.use { input ->
+                            val imported = BackupHelper.importAccounts(password, input)
+                            withContext(Dispatchers.Main) { addBatchAccounts(imported) }
+                        }
+                    } catch (e: Exception) {
+                        withContext(Dispatchers.Main) { Toast.makeText(context, "Import Failed: Wrong Password?", Toast.LENGTH_LONG).show() }
+                    }
+                }
+            })
+        }
+    }
+}
+
+/**
+ * Parse QR code content and extract OTP account information
+ */
+private fun parseQrContent(url: String, context: android.content.Context): Account? {
+    return try {
+        // Check standard otpauth URI
+        if (url.startsWith("otpauth://")) {
+            val uri = Uri.parse(url)
+            if (uri.host == "totp") {
+                val secret = uri.getQueryParameter("secret")
+                val issuer = uri.getQueryParameter("issuer") ?: "Unknown"
+                val label = uri.path?.trim('/') ?: "Account"
+                if (secret != null) {
+                    return Account(issuer = issuer, label = label, secret = secret)
+                }
+            }
+        }
+        
+        // Check plain Base32 secret
+        if (isValidBase32(url)) {
+            return Account(issuer = "QR Code", label = "Imported Account", secret = url)
+        }
+        
+        // Extract from URL params
+        extractFromUrlParams(url)
+    } catch (e: Exception) {
+        null
+    }
+}
+
+private fun isValidBase32(input: String): Boolean {
+    val clean = input.trim().uppercase()
+    val pattern = Pattern.compile("^[A-Z2-7]+=*$")
+    return pattern.matcher(clean).matches() && clean.length in 16..32
+}
+
+private fun extractFromUrlParams(url: String): Account? {
+    return try {
+        val secretRegex = Regex("secret=([A-Z2-7]+)", RegexOption.IGNORE_CASE)
+        val secretMatch = secretRegex.find(url)
+        
+        if (secretMatch != null) {
+            val secret = secretMatch.groupValues[1]
+            val issuerRegex = Regex("issuer=([^&]+)", RegexOption.IGNORE_CASE)
+            val issuerMatch = issuerRegex.find(url)
+            val issuer = issuerMatch?.groupValues?.get(1) ?: "Unknown"
+            
+            val labelRegex = Regex("/([^?]+)\\?")
+            val labelMatch = labelRegex.find(url)
+            val label = labelMatch?.groupValues?.get(1) ?: "Account"
+            
+            return Account(issuer = issuer, label = label, secret = secret)
+        }
+        null
+    } catch (e: Exception) {
+        null
+    }
+}
+
+@Composable
+fun PasswordDialog(title: String, onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
+    var password by remember { mutableStateOf("") }
+    
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column {
+                Text("Enter encryption password:")
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    label = { Text("Password") },
+                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { if (password.isNotEmpty()) onConfirm(password) },
+                enabled = password.isNotEmpty()
+            ) { Text("Confirm") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
+}
+--- End of MainActivity.kt ---
+
+├── crypto
+│   ├── Base32.kt
+
+--- File: crypto\Base32.kt ---
+package com.otp.auth.crypto
+
+object Base32 {
+
+    private const val ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+    private val LOOKUP = IntArray(256) { -1 }.apply {
+        for (i in ALPHABET.indices) {
+            this[ALPHABET[i].code] = i
+        }
+    }
+
+    /* =======================
+       ======= DECODE =========
+       ======================= */
+
+    fun decode(encoded: String): ByteArray {
+        val clean = encoded
+            .trim()
+            .replace("-", "")
+            .replace(" ", "")
+            .uppercase()
+            .trimEnd('=')
+
+        if (clean.isEmpty()) return ByteArray(0)
+
+        val out = ByteArray(clean.length * 5 / 8)
+        var buffer = 0
+        var bitsLeft = 0
+        var index = 0
+
+        for (c in clean) {
+            val value = if (c.code < 256) LOOKUP[c.code] else -1
+            require(value >= 0) { "Invalid Base32 character: $c" }
+
+            buffer = (buffer shl 5) or value
+            bitsLeft += 5
+
+            if (bitsLeft >= 8) {
+                out[index++] = ((buffer shr (bitsLeft - 8)) and 0xFF).toByte()
+                bitsLeft -= 8
+            }
+        }
+
+        return if (index == out.size) out else out.copyOf(index)
+    }
+
+    /* =======================
+       ======= ENCODE =========
+       ======================= */
+
+    fun encode(bytes: ByteArray): String {
+        if (bytes.isEmpty()) return ""
+
+        val out = StringBuilder((bytes.size * 8 + 4) / 5)
+        var buffer = 0
+        var bitsLeft = 0
+
+        for (b in bytes) {
+            buffer = (buffer shl 8) or (b.toInt() and 0xFF)
+            bitsLeft += 8
+
+            while (bitsLeft >= 5) {
+                out.append(ALPHABET[(buffer shr (bitsLeft - 5)) and 31])
+                bitsLeft -= 5
+            }
+        }
+
+        if (bitsLeft > 0) {
+            out.append(ALPHABET[(buffer shl (5 - bitsLeft)) and 31])
+        }
+
+        return out.toString()
+    }
+}
+
+--- End of crypto\Base32.kt ---
+
+│   └── TotpEngine.kt
+
+--- File: crypto\TotpEngine.kt ---
+package com.otp.auth.crypto
+
+import java.nio.ByteBuffer
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
+
+object TotpEngine {
+    private const val ALGORITHM = "HmacSHA1"
+    private const val PERIOD = 30L
+
+    fun generateNow(secret: String): String {
+        return try {
+            val keyBytes = Base32.decode(secret)
+            val time = System.currentTimeMillis() / 1000 / PERIOD
+            generateTOTP(keyBytes, time)
+        } catch (e: Exception) {
+            "000000"
+        }
+    }
+
+    fun getProgress(): Float {
+        val time = System.currentTimeMillis() / 1000.0
+        val remaining = PERIOD - (time % PERIOD)
+        return (remaining / PERIOD).toFloat()
+    }
+
+    private fun generateTOTP(key: ByteArray, time: Long): String {
+        val msg = ByteBuffer.allocate(8).putLong(time).array()
+        val hmac = Mac.getInstance(ALGORITHM)
+        hmac.init(SecretKeySpec(key, ALGORITHM))
+        val hash = hmac.doFinal(msg)
+
+        val offset = hash[hash.size - 1].toInt() and 0xf
+        val binary = ((hash[offset].toInt() and 0x7f) shl 24) or
+                ((hash[offset + 1].toInt() and 0xff) shl 16) or
+                ((hash[offset + 2].toInt() and 0xff) shl 8) or
+                (hash[offset + 3].toInt() and 0xff)
+
+        val otp = binary % 1_000_000
+        return String.format("%06d", otp)
+    }
+}
+--- End of crypto\TotpEngine.kt ---
+
+├── data
+│   ├── Account.kt
+
+--- File: data\Account.kt ---
+package com.otp.auth.data
+
+data class Account(
+    val id: String = java.util.UUID.randomUUID().toString(),
+    val issuer: String,
+    val label: String,
+    val secret: String
+)
+--- End of data\Account.kt ---
+
+│   ├── AccountRepository.kt
+
+--- File: data\AccountRepository.kt ---
+package com.otp.auth.data
+
+import android.content.Context
+import android.content.SharedPreferences
+import android.util.Log
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
+class AccountRepository(context: Context) {
+    private val gson = Gson()
+    private val sharedPreferences: SharedPreferences
+
+    init {
+        // 1. Create the Master Key (Stored in Android Keystore)
+        val masterKey = MasterKey.Builder(context)
+            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+            .build()
+
+        // 2. Open Encrypted Preferences
+        // This looks like normal SharedPreferences but encrypts everything automatically.
+        sharedPreferences = EncryptedSharedPreferences.create(
+            context,
+            "secure_otp_accounts", // File name
+            masterKey,
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+        )
+    }
+
+    suspend fun saveAccounts(accounts: List<Account>) = withContext(Dispatchers.IO) {
+        try {
+            // Convert List -> JSON
+            val json = gson.toJson(accounts)
+            
+            // Save (Encryption happens automatically)
+            sharedPreferences.edit()
+                .putString("accounts_data", json)
+                .commit() // Commit ensures it writes to disk immediately
+                
+            Log.d("AccountRepo", "Saved ${accounts.size} accounts securely.")
+        } catch (e: Exception) {
+            Log.e("AccountRepo", "Save Failed", e)
+        }
+    }
+
+    suspend fun loadAccounts(): List<Account> = withContext(Dispatchers.IO) {
+        try {
+            // Load (Decryption happens automatically)
+            val json = sharedPreferences.getString("accounts_data", null)
+            
+            if (json.isNullOrEmpty()) {
+                return@withContext emptyList()
+            }
+
+            // Convert JSON -> List
+            val type = object : TypeToken<List<Account>>() {}.type
+            val list: List<Account> = gson.fromJson(json, type) ?: emptyList()
+            
+            Log.d("AccountRepo", "Loaded ${list.size} accounts.")
+            return@withContext list
+        } catch (e: Exception) {
+            Log.e("AccountRepo", "Load Failed", e)
+            return@withContext emptyList()
+        }
+    }
+}
+--- End of data\AccountRepository.kt ---
+
+│   └── SettingsManager.kt
+
+--- File: data\SettingsManager.kt ---
+package com.otp.auth.data
+
+import android.content.Context
+import android.content.SharedPreferences
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+enum class AppThemeMode {
+    SYSTEM, LIGHT, DARK
+}
+
+class SettingsManager(context: Context) {
+    private val prefs: SharedPreferences = context.getSharedPreferences("otp_settings", Context.MODE_PRIVATE)
+    
+    // Theme State
+    private val _themeMode = MutableStateFlow(loadThemeMode())
+    val themeMode: StateFlow<AppThemeMode> = _themeMode.asStateFlow()
+
+    // Privacy State
+    private val _isPrivacyEnabled = MutableStateFlow(prefs.getBoolean("privacy_enabled", false))
+    val isPrivacyEnabled: StateFlow<Boolean> = _isPrivacyEnabled.asStateFlow()
+
+    fun setThemeMode(mode: AppThemeMode) {
+        prefs.edit().putString("theme_mode", mode.name).apply()
+        _themeMode.value = mode
+    }
+
+    fun setPrivacyEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("privacy_enabled", enabled).apply()
+        _isPrivacyEnabled.value = enabled
+    }
+
+    private fun loadThemeMode(): AppThemeMode {
+        val savedName = prefs.getString("theme_mode", AppThemeMode.SYSTEM.name)
+        return try {
+            AppThemeMode.valueOf(savedName ?: AppThemeMode.SYSTEM.name)
+        } catch (e: Exception) {
+            AppThemeMode.SYSTEM
+        }
+    }
+}
+--- End of project_dump.txt ---
+
+├── ui
+│   ├── AboutScreen.kt
+
+--- File: ui\AboutScreen.kt ---
+package com.otp.auth.ui
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+
+@Composable
+fun AboutScreen() {
+    Column(
+        Modifier.fillMaxSize().padding(16.dp).background(MaterialTheme.colorScheme.background)
+    ) {
+        Text("About Developer", style = MaterialTheme.typography.headlineMedium, color = MaterialTheme.colorScheme.primary)
+        Spacer(Modifier.height(16.dp))
+        InfoItem("Name", "Shoaib Hassan")
+        InfoItem("Role", "Systems & Security Software Engineer")
+        Spacer(Modifier.height(16.dp))
+        Text("Professional Summary", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+        Text("Security-focused developer with strong experience in low-level systems programming, reverse engineering, and secure application design.", style = MaterialTheme.typography.bodyMedium)
+        Spacer(Modifier.height(24.dp))
+        Divider()
+        Spacer(Modifier.height(8.dp))
+        Text("Disclaimer: Independent app, not affiliated with Google.", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+    }
+}
+
+@Composable
+fun InfoItem(label: String, value: String) {
+    Row(Modifier.padding(vertical = 4.dp)) {
+        Text("$label: ", fontWeight = FontWeight.Bold)
+        Text(value)
+    }
+}
+--- End of ui\AboutScreen.kt ---
+
+│   ├── ExportScreen.kt
+
+--- File: ui\ExportScreen.kt ---
+package com.otp.auth.ui
+
+import android.graphics.Bitmap
+import android.graphics.Color as AndroidColor
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.qrcode.QRCodeWriter
+import com.otp.auth.data.Account
+import com.otp.auth.utils.GoogleAuthMigration
+
+@Composable
+fun ExportScreen(
+    accounts: List<Account>,
+    onClose: () -> Unit
+) {
+    // 1. Generate URIs (Batched)
+    val exportUris = remember(accounts) { GoogleAuthMigration.getExportUris(accounts) }
+    var currentIndex by remember { mutableIntStateOf(0) }
+    
+    // 2. Generate QR Bitmap for current index
+    val qrBitmap = remember(currentIndex, exportUris) {
+        if (exportUris.isNotEmpty()) generateQrBitmap(exportUris[currentIndex]) else null
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            .padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(
+            text = "Export Accounts",
+            style = MaterialTheme.typography.headlineMedium,
+            color = MaterialTheme.colorScheme.primary
+        )
+        
+        Spacer(modifier = Modifier.height(32.dp))
+
+        Card(
+            shape = RoundedCornerShape(16.dp),
+            elevation = CardDefaults.cardElevation(8.dp),
+            colors = CardDefaults.cardColors(containerColor = androidx.compose.ui.graphics.Color.White)
+        ) {
+            Box(Modifier.padding(16.dp)) {
+                if (qrBitmap != null) {
+                    Image(
+                        bitmap = qrBitmap.asImageBitmap(),
+                        contentDescription = "Export QR Code",
+                        modifier = Modifier.size(280.dp)
+                    )
+                } else {
+                    Box(Modifier.size(280.dp), contentAlignment = Alignment.Center) {
+                        Text("No accounts to export", color = androidx.compose.ui.graphics.Color.Black)
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        if (exportUris.size > 1) {
+            Text(
+                text = "Part ${currentIndex + 1} of ${exportUris.size}",
+                style = MaterialTheme.typography.titleMedium
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly
+            ) {
+                Button(
+                    onClick = { if (currentIndex > 0) currentIndex-- },
+                    enabled = currentIndex > 0
+                ) { Text("Previous") }
+                
+                Button(
+                    onClick = { if (currentIndex < exportUris.size - 1) currentIndex++ },
+                    enabled = currentIndex < exportUris.size - 1
+                ) { Text("Next") }
+            }
+        } else {
+            Button(onClick = onClose, modifier = Modifier.fillMaxWidth()) {
+                Text("Done")
+            }
+        }
+    }
+}
+
+private fun generateQrBitmap(content: String): Bitmap? {
+    return try {
+        val writer = QRCodeWriter()
+        val bitMatrix = writer.encode(content, BarcodeFormat.QR_CODE, 512, 512)
+        val w = bitMatrix.width
+        val h = bitMatrix.height
+        val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.RGB_565)
+        for (x in 0 until w) {
+            for (y in 0 until h) {
+                bitmap.setPixel(x, y, if (bitMatrix[x, y]) AndroidColor.BLACK else AndroidColor.WHITE)
+            }
+        }
+        bitmap
+    } catch (e: Exception) {
+        null
+    }
+}
+--- End of ui\ExportScreen.kt ---
+
+│   ├── HomeScreen.kt
+
+--- File: ui\HomeScreen.kt ---
+package com.otp.auth.ui
+
+import android.widget.Toast
+import androidx.compose.animation.*
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.otp.auth.crypto.TotpEngine
+import com.otp.auth.data.Account
+
+@Composable
+fun HomeScreen(accounts: List<Account>, progress: Float, onDelete: (Account) -> Unit) {
+    // STATE: Track which account is pending deletion
+    var accountToDelete by remember { mutableStateOf<Account?>(null) }
+
+    if (accounts.isEmpty()) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Text(
+                "No accounts yet.\nTap + to add.",
+                textAlign = TextAlign.Center,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.titleMedium
+            )
+        }
+    } else {
+        LazyColumn(
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            items(items = accounts, key = { it.id }) { account ->
+                // CHANGE: Instead of passing 'onDelete' directly, we pass a lambda
+                // that sets the 'accountToDelete' state.
+                AccountCard(
+                    account = account, 
+                    progress = progress, 
+                    onDelete = { accountToDelete = it }
+                )
+            }
+        }
+    }
+
+    // --- DELETE CONFIRMATION DIALOG ---
+    if (accountToDelete != null) {
+        AlertDialog(
+            onDismissRequest = { accountToDelete = null },
+            icon = { Icon(Icons.Default.Delete, contentDescription = null) },
+            title = { Text("Delete Account") },
+            text = { 
+                Text("Are you sure you want to delete \"${accountToDelete?.label}\"?\n\nThis action cannot be undone.") 
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        // Perform the actual deletion here
+                        accountToDelete?.let { onDelete(it) }
+                        accountToDelete = null
+                    },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { accountToDelete = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+}
+
+@Composable
+fun AccountCard(account: Account, progress: Float, onDelete: (Account) -> Unit) {
+    var otpCode by remember { mutableStateOf("------") }
+    val clipboardManager = LocalClipboardManager.current
+    val context = LocalContext.current
+    
+    // Touch Animation State
+    val interactionSource = remember { MutableInteractionSource() }
+    val isPressed by interactionSource.collectIsPressedAsState()
+    val scale by animateFloatAsState(if (isPressed) 0.96f else 1f, label = "pressScale")
+
+    // Update OTP
+    LaunchedEffect(progress) {
+        val newCode = TotpEngine.generateNow(account.secret)
+        if (newCode != otpCode) otpCode = newCode
+    }
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .scale(scale) // Apply press animation
+            .clickable(
+                interactionSource = interactionSource,
+                indication = null // Disable default ripple to use ours or custom
+            ) {
+                clipboardManager.setText(AnnotatedString(otpCode))
+                Toast.makeText(context, "Copied code", Toast.LENGTH_SHORT).show()
+            },
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Row(
+            modifier = Modifier.padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    account.issuer,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Text(
+                    account.label,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+
+                // ANIMATION: Digit Vertical Slide
+                AnimatedContent(
+                    targetState = otpCode,
+                    transitionSpec = {
+                        slideInVertically { height -> height } + fadeIn() togetherWith
+                                slideOutVertically { height -> -height } + fadeOut()
+                    },
+                    label = "OtpDigitAnim"
+                ) { code ->
+                    Text(
+                        text = "${code.take(3)} ${code.takeLast(3)}",
+                        style = MaterialTheme.typography.headlineLarge.copy(
+                            fontFamily = FontFamily.Monospace,
+                            letterSpacing = 2.sp
+                        ),
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+            }
+            
+            // Actions Row
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                // Circular Timer
+                Box(contentAlignment = Alignment.Center, modifier = Modifier.size(44.dp)) {
+                    val color by animateColorAsState(
+                        targetValue = when {
+                            progress < 0.15f -> Color(0xFFFF5252) // Critical Red
+                            progress < 0.4f -> Color(0xFFFFD740) // Warning Yellow
+                            else -> MaterialTheme.colorScheme.primary // Calm Blue
+                        },
+                        label = "timerColor"
+                    )
+                    
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        // Background Track
+                        drawArc(
+                            color = Color.LightGray.copy(alpha = 0.3f),
+                            startAngle = 0f,
+                            sweepAngle = 360f,
+                            useCenter = false,
+                            style = Stroke(width = 4.dp.toPx())
+                        )
+                        // Progress Arc
+                        drawArc(
+                            color = color,
+                            startAngle = -90f,
+                            sweepAngle = progress * 360f,
+                            useCenter = false,
+                            style = Stroke(width = 4.dp.toPx(), cap = StrokeCap.Round)
+                        )
+                    }
+                    Text(
+                        "${(progress * 30).toInt()}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                
+                Spacer(Modifier.width(8.dp))
+                
+                // Delete Button
+                IconButton(onClick = { onDelete(account) }) {
+                    Icon(
+                        Icons.Default.Delete,
+                        contentDescription = "Delete",
+                        tint = MaterialTheme.colorScheme.error.copy(alpha = 0.7f)
+                    )
+                }
+            }
+        }
+    }
+}
+--- End of ui\HomeScreen.kt ---
+
+│   ├── ManualEntryScreen.kt
+
+--- File: ui\ManualEntryScreen.kt ---
+package com.otp.auth.ui
+
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+
+@Composable
+fun ManualEntryScreen(onSave: (String, String, String) -> Unit) {
+    var issuer by remember { mutableStateOf("") }
+    var label by remember { mutableStateOf("") }
+    var secret by remember { mutableStateOf("") }
+
+    Column(Modifier.padding(16.dp).fillMaxWidth()) {
+        OutlinedTextField(value = issuer, onValueChange = { issuer = it }, label = { Text("Issuer (e.g., Google)") }, modifier = Modifier.fillMaxWidth())
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(value = label, onValueChange = { label = it }, label = { Text("Account Name") }, modifier = Modifier.fillMaxWidth())
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(value = secret, onValueChange = { secret = it }, label = { Text("Secret Key") }, modifier = Modifier.fillMaxWidth())
+        Spacer(Modifier.height(16.dp))
+        Button(
+            onClick = { onSave(issuer, label, secret) },
+            modifier = Modifier.fillMaxWidth(),
+            enabled = secret.isNotEmpty()
+        ) {
+            Text("Add Account")
+        }
+    }
+}
+--- End of ui\ManualEntryScreen.kt ---
+
+│   ├── MlKitQrScanner.kt
+
+--- File: ui\MlKitQrScanner.kt ---
+package com.otp.auth.ui
+
+import android.content.Context
+import android.graphics.*
+import android.util.AttributeSet
+import android.util.Log
+import android.view.View
+import android.widget.FrameLayout
+import androidx.camera.core.Camera as CameraX
+import androidx.camera.core.TorchState
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
+import androidx.camera.core.AspectRatio
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.LifecycleOwner
+import com.google.mlkit.vision.barcode.BarcodeScanner
+import com.google.mlkit.vision.barcode.BarcodeScannerOptions
+import com.google.mlkit.vision.barcode.BarcodeScanning
+import com.google.mlkit.vision.barcode.common.Barcode
+import com.google.mlkit.vision.common.InputImage
+import kotlinx.coroutines.*
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import kotlin.math.min
+
+@androidx.annotation.OptIn(androidx.camera.core.ExperimentalGetImage::class)
+class MlKitQrScanner @JvmOverloads constructor(
+    context: Context,
+    attrs: AttributeSet? = null,
+    defStyleAttr: Int = 0
+) : FrameLayout(context, attrs, defStyleAttr) {
+
+    private lateinit var previewView: PreviewView
+    private var cameraProvider: ProcessCameraProvider? = null
+    private var cameraX: CameraX? = null  // Renamed to avoid ambiguity
+    private var analysisExecutor: ExecutorService? = null
+    private var barcodeScanner: BarcodeScanner? = null
+    private var qrOverlay: QrOverlay? = null
+    private var onQrDetected: ((String, RectF) -> Unit)? = null
+    private var isProcessing = false
+    private var lastDetectedCode: String? = null
+    private var lastDetectionTime: Long = 0
+    
+    // Auto-zoom properties
+    private var targetBarcodeWidth: Float = 0.3f // Target 30% of screen width
+    private var currentZoomRatio: Float = 1.0f
+    private val zoomSmoothingFactor = 0.2f
+    
+    // Animation properties
+    private var scanLinePosition = 0f
+    private var scanLineDirection = 1
+    private val scanLineSpeed = 5f
+    
+    companion object {
+        private const val TAG = "MlKitQrScanner"
+        private const val DEBOUNCE_DELAY = 2000L // 2 seconds between scans
+    }
+
+    init {
+        setupScanner()
+        setupView()
+    }
+
+    private fun setupView() {
+        // Create and add PreviewView as a child
+        previewView = PreviewView(context).apply {
+            layoutParams = LayoutParams(
+                LayoutParams.MATCH_PARENT,
+                LayoutParams.MATCH_PARENT
+            )
+            scaleType = PreviewView.ScaleType.FILL_CENTER
+        }
+        addView(previewView)
+        
+        // Add overlay on top
+        qrOverlay = QrOverlay(context).apply {
+            layoutParams = LayoutParams(
+                LayoutParams.MATCH_PARENT,
+                LayoutParams.MATCH_PARENT
+            )
+        }
+        addView(qrOverlay)
+    }
+
+    private fun setupScanner() {
+        // Initialize barcode scanner
+        val options = BarcodeScannerOptions.Builder()
+            .setBarcodeFormats(
+                Barcode.FORMAT_QR_CODE,
+                Barcode.FORMAT_AZTEC
+            )
+            .enableAllPotentialBarcodes()
+            .build()
+        
+        barcodeScanner = BarcodeScanning.getClient(options)
+        analysisExecutor = Executors.newSingleThreadExecutor()
+        
+        // Start animation
+        startScanAnimation()
+    }
+
+    fun startCamera(lifecycleOwner: LifecycleOwner, onQrDetected: (String, RectF) -> Unit) {
+        this.onQrDetected = onQrDetected
+        
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
+        cameraProviderFuture.addListener({
+            cameraProvider = cameraProviderFuture.get()
+            bindCameraUseCases(lifecycleOwner)
+        }, ContextCompat.getMainExecutor(context))
+    }
+
+    private fun bindCameraUseCases(lifecycleOwner: LifecycleOwner) {
+        val cameraProvider = cameraProvider ?: return
+
+        // Unbind existing use cases
+        cameraProvider.unbindAll()
+
+        // Camera selector - choose back camera by default
+        val cameraSelector = CameraSelector.Builder()
+            .requireLensFacing(CameraSelector.LENS_FACING_BACK)
+            .build()
+
+        // Preview
+        val preview = Preview.Builder()
+            .setTargetAspectRatio(AspectRatio.RATIO_16_9)
+            .setTargetRotation(display.rotation)
+            .build()
+            .also {
+                it.setSurfaceProvider(previewView.surfaceProvider)
+            }
+
+        // Image Analysis for QR detection
+        val imageAnalysis = ImageAnalysis.Builder()
+            .setTargetAspectRatio(AspectRatio.RATIO_16_9)
+            .setTargetRotation(display.rotation)
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+            .build()
+
+        imageAnalysis.setAnalyzer(analysisExecutor ?: Executors.newSingleThreadExecutor()) { imageProxy ->
+            processImage(imageProxy)
+        }
+
+        try {
+            // Bind use cases to camera
+            cameraX = cameraProvider.bindToLifecycle(
+                lifecycleOwner,
+                cameraSelector,
+                preview,
+                imageAnalysis
+            )
+            
+            // Set up camera control callbacks
+            setupCameraControls()
+        } catch (exc: Exception) {
+            Log.e(TAG, "Use case binding failed", exc)
+        }
+    }
+
+    private fun setupCameraControls() {
+        cameraX?.let { cam ->
+            // Enable auto-focus (torch is disabled by default)
+            cam.cameraControl.enableTorch(false)
+            
+            // Set up zoom state observer
+            cam.cameraInfo.zoomState.observeForever { zoomState ->
+                zoomState?.let {
+                    currentZoomRatio = it.zoomRatio
+                }
+            }
+        }
+    }
+
+    private fun processImage(imageProxy: ImageProxy) {
+        if (isProcessing) {
+            imageProxy.close()
+            return
+        }
+        
+        val mediaImage = imageProxy.image ?: run {
+            imageProxy.close()
+            return
+        }
+
+        val image = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
+        
+        barcodeScanner?.process(image)
+            ?.addOnSuccessListener { barcodes ->
+                handleDetectedBarcodes(barcodes, imageProxy)
+            }
+            ?.addOnFailureListener { e ->
+                Log.e(TAG, "Barcode scanning failed", e)
+                imageProxy.close()
+            }
+            ?.addOnCompleteListener {
+                // Ensure image is closed
+                imageProxy.close()
+            }
+    }
+
+    private fun handleDetectedBarcodes(barcodes: List<Barcode>, imageProxy: ImageProxy) {
+        if (barcodes.isEmpty()) {
+            qrOverlay?.clearBoundingBox()
+            return
+        }
+
+        // Find the largest QR code (most likely the target)
+        val primaryBarcode = barcodes.maxByOrNull { 
+            it.boundingBox?.width() ?: 0
+        } ?: return
+
+        primaryBarcode.rawValue?.let { rawValue ->
+            primaryBarcode.boundingBox?.let { boundingBox ->
+                // Transform bounding box to view coordinates
+                val transformedBox = transformBoundingBox(boundingBox, imageProxy)
+                
+                // Check if this is a new detection (debounce)
+                val now = System.currentTimeMillis()
+                if (rawValue != lastDetectedCode || now - lastDetectionTime > DEBOUNCE_DELAY) {
+                    lastDetectedCode = rawValue
+                    lastDetectionTime = now
+                    
+                    // Update overlay on UI thread
+                    post {
+                        qrOverlay?.setBoundingBox(transformedBox)
+                        
+                        // Auto-zoom on detected QR code
+                        autoZoomOnBarcode(transformedBox)
+                        
+                        // Trigger callback
+                        onQrDetected?.invoke(rawValue, transformedBox)
+                    }
+                } else {
+                    // Update overlay but don't trigger callback
+                    post {
+                        qrOverlay?.setBoundingBox(transformedBox)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun transformBoundingBox(
+        boundingBox: Rect,
+        imageProxy: ImageProxy
+    ): RectF {
+        // Get the transformation matrix from image to view
+        val matrix = Matrix()
+        
+        // Get view dimensions
+        val viewWidth = width.toFloat()
+        val viewHeight = height.toFloat()
+        
+        // Get image dimensions
+        val imageWidth = imageProxy.width.toFloat()
+        val imageHeight = imageProxy.height.toFloat()
+        
+        // Calculate scale factors
+        val scaleX = viewWidth / imageWidth
+        val scaleY = viewHeight / imageHeight
+        val scale = min(scaleX, scaleY)
+        
+        // Calculate offset to center the image
+        val offsetX = (viewWidth - imageWidth * scale) / 2
+        val offsetY = (viewHeight - imageHeight * scale) / 2
+        
+        // Apply transformation
+        matrix.setScale(scale, scale)
+        matrix.postTranslate(offsetX, offsetY)
+        
+        // Apply rotation if needed
+        when (imageProxy.imageInfo.rotationDegrees) {
+            90 -> matrix.postRotate(90f, viewWidth / 2, viewHeight / 2)
+            180 -> matrix.postRotate(180f, viewWidth / 2, viewHeight / 2)
+            270 -> matrix.postRotate(270f, viewWidth / 2, viewHeight / 2)
+        }
+        
+        // Transform bounding box
+        val srcRectF = RectF(boundingBox)
+        val dstRectF = RectF()
+        matrix.mapRect(dstRectF, srcRectF)
+        
+        return dstRectF
+    }
+
+    private fun autoZoomOnBarcode(boundingBox: RectF) {
+        cameraX?.let { cam ->
+            val cameraInfo = cam.cameraInfo
+            val cameraControl = cam.cameraControl
+            
+            // Get current zoom state
+            val zoomState = cameraInfo.zoomState.value ?: return
+            
+            // Calculate desired zoom level based on barcode size
+            val barcodeWidthPercent = boundingBox.width() / width
+            val zoomDelta = targetBarcodeWidth / barcodeWidthPercent
+            
+            // Clamp zoom ratio to camera's range
+            val minZoom = zoomState.minZoomRatio
+            val maxZoom = zoomState.maxZoomRatio
+            val newZoom = (currentZoomRatio * zoomDelta).coerceIn(minZoom, maxZoom)
+            
+            // Apply smoothed zoom
+            val smoothedZoom = currentZoomRatio + (newZoom - currentZoomRatio) * zoomSmoothingFactor
+            
+            // Set zoom
+            cameraControl.setZoomRatio(smoothedZoom)
+        }
+    }
+
+    private fun startScanAnimation() {
+        // Create a coroutine scope for animation
+        val animationScope = CoroutineScope(Dispatchers.Main)
+        
+        animationScope.launch {
+            while (isActive) {
+                scanLinePosition += scanLineDirection * scanLineSpeed
+                
+                // Reverse direction at bounds
+                if (scanLinePosition > height || scanLinePosition < 0) {
+                    scanLineDirection *= -1
+                    scanLinePosition = scanLinePosition.coerceIn(0f, height.toFloat())
+                }
+                
+                qrOverlay?.setScanLinePosition(scanLinePosition)
+                qrOverlay?.invalidate()
+                
+                delay(16) // ~60 FPS
+            }
+        }
+    }
+
+    fun stopCamera() {
+        cameraProvider?.unbindAll()
+        analysisExecutor?.shutdown()
+        barcodeScanner?.close()
+        qrOverlay?.clearBoundingBox()
+    }
+
+    fun toggleTorch() {
+        cameraX?.cameraControl?.let { control ->
+            val torchState = cameraX?.cameraInfo?.torchState?.value
+            val isTorchOn = torchState == TorchState.ON
+            control.enableTorch(!isTorchOn)
+        }
+    }
+
+    fun switchCamera() {
+        // Implementation for front/back camera switching
+        // You can extend this based on your needs
+    }
+}
+
+class QrOverlay @JvmOverloads constructor(
+    context: Context,
+    attrs: AttributeSet? = null,
+    defStyleAttr: Int = 0
+) : View(context, attrs, defStyleAttr) {
+    
+    private val boundingBoxPaint = Paint().apply {
+        color = Color.GREEN
+        style = Paint.Style.STROKE
+        strokeWidth = 4f
+        strokeCap = Paint.Cap.ROUND
+        isAntiAlias = true
+    }
+    
+    private val fillPaint = Paint().apply {
+        color = Color.argb(30, 0, 255, 0) // Semi-transparent green
+        style = Paint.Style.FILL
+    }
+    
+    private val scanLinePaint = Paint().apply {
+        color = Color.CYAN
+        style = Paint.Style.FILL
+        strokeWidth = 3f
+        isAntiAlias = true
+        alpha = 200
+    }
+    
+    private val cornerPaint = Paint().apply {
+        color = Color.GREEN
+        style = Paint.Style.FILL
+        strokeWidth = 8f
+        isAntiAlias = true
+    }
+    
+    private var boundingBox: RectF? = null
+    private var scanLineY = 0f
+    private val cornerLength = 40f
+    private val pulsePaint = Paint().apply {
+        color = Color.GREEN
+        style = Paint.Style.STROKE
+        strokeWidth = 2f
+        alpha = 150
+    }
+    private var pulseRadius = 0f
+    private var pulseAlpha = 255
+    
+    fun setBoundingBox(box: RectF?) {
+        boundingBox = box
+        invalidate()
+    }
+    
+    fun setScanLinePosition(y: Float) {
+        scanLineY = y
+    }
+    
+    fun clearBoundingBox() {
+        boundingBox = null
+        invalidate()
+    }
+    
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        
+        boundingBox?.let { box ->
+            // Draw filled background
+            canvas.drawRect(box, fillPaint)
+            
+            // Draw bounding box
+            canvas.drawRect(box, boundingBoxPaint)
+            
+            // Draw animated scan line within the bounding box
+            if (scanLineY in box.top..box.bottom) {
+                canvas.drawLine(
+                    box.left,
+                    scanLineY,
+                    box.right,
+                    scanLineY,
+                    scanLinePaint
+                )
+            }
+            
+            // Draw corner markers
+            drawCorner(canvas, box.left, box.top, 0f) // Top-left
+            drawCorner(canvas, box.right, box.top, 90f) // Top-right
+            drawCorner(canvas, box.left, box.bottom, 270f) // Bottom-left
+            drawCorner(canvas, box.right, box.bottom, 180f) // Bottom-right
+            
+            // Draw pulse animation
+            drawPulseAnimation(canvas, box)
+        }
+    }
+    
+    private fun drawCorner(canvas: Canvas, x: Float, y: Float, rotation: Float) {
+        canvas.save()
+        canvas.translate(x, y)
+        canvas.rotate(rotation)
+        
+        // Draw L-shaped corner
+        canvas.drawLine(0f, 0f, cornerLength, 0f, cornerPaint)
+        canvas.drawLine(0f, 0f, 0f, cornerLength, cornerPaint)
+        
+        canvas.restore()
+    }
+    
+    private fun drawPulseAnimation(canvas: Canvas, box: RectF) {
+        val centerX = box.centerX()
+        val centerY = box.centerY()
+        val maxRadius = min(box.width(), box.height()) / 2
+        
+        pulseRadius += 2f
+        pulseAlpha -= 5
+        
+        if (pulseRadius > maxRadius) {
+            pulseRadius = 0f
+            pulseAlpha = 255
+        }
+        
+        pulsePaint.alpha = pulseAlpha.coerceIn(0, 255)
+        canvas.drawCircle(centerX, centerY, pulseRadius, pulsePaint)
+    }
+}
+--- End of ui\MlKitQrScanner.kt ---
+
+│   ├── ScanScreen.kt
+
+--- File: ui\ScanScreen.kt ---
+package com.otp.auth.ui
+
+import android.Manifest
+import android.graphics.Matrix
+import android.graphics.RectF
+import android.util.Log
+import android.view.ViewGroup
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.core.*
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
+import com.google.mlkit.vision.barcode.BarcodeScanner
+import com.google.mlkit.vision.barcode.BarcodeScannerOptions
+import com.google.mlkit.vision.barcode.BarcodeScanning
+import com.google.mlkit.vision.barcode.common.Barcode
+import com.google.mlkit.vision.common.InputImage
+import kotlinx.coroutines.*
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import kotlin.math.max
+
+@androidx.annotation.OptIn(androidx.camera.core.ExperimentalGetImage::class)
+@Composable
+fun ScanScreen(onCodeFound: (String) -> Unit) {
+    var hasPermission by remember { mutableStateOf(false) }
+    var isProcessing by remember { mutableStateOf(false) }
+    var torchEnabled by remember { mutableStateOf(false) }
+    var qrBoundingBox by remember { mutableStateOf<RectF?>(null) }
+    var scanLineY by remember { mutableFloatStateOf(0f) }
+    
+    // Camera State to control Torch
+    var camera by remember { mutableStateOf<Camera?>(null) }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val context = LocalContext.current
+    
+    var cameraProvider by remember { mutableStateOf<ProcessCameraProvider?>(null) }
+    var barcodeScanner by remember { mutableStateOf<BarcodeScanner?>(null) }
+    var analysisExecutor by remember { mutableStateOf<ExecutorService?>(null) }
+    
+    val permissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        hasPermission = isGranted
+    }
+
+    // Cleanup
+    DisposableEffect(Unit) {
+        onDispose {
+            cameraProvider?.unbindAll()
+            analysisExecutor?.shutdown()
+            barcodeScanner?.close()
+        }
+    }
+
+    // Initialize
+    LaunchedEffect(Unit) {
+        val options = BarcodeScannerOptions.Builder()
+            .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
+            .enableAllPotentialBarcodes()
+            .build()
+        
+        barcodeScanner = BarcodeScanning.getClient(options)
+        analysisExecutor = Executors.newSingleThreadExecutor()
+        
+        permissionLauncher.launch(Manifest.permission.CAMERA)
+    }
+
+    // Animation Loop
+    LaunchedEffect(Unit) {
+        while (true) {
+            scanLineY += 0.01f // Slower, smoother animation
+            if (scanLineY > 1f) scanLineY = 0f
+            delay(16)
+        }
+    }
+
+    // FIX: Torch Control Logic
+    LaunchedEffect(torchEnabled, camera) {
+        try {
+            camera?.cameraControl?.enableTorch(torchEnabled)
+        } catch (e: Exception) {
+            Log.e("ScanScreen", "Failed to toggle torch", e)
+        }
+    }
+
+    if (hasPermission) {
+        Box(modifier = Modifier.fillMaxSize()) {
+            // Camera Preview
+            AndroidView(
+                modifier = Modifier.fillMaxSize(),
+                factory = { ctx ->
+                    val previewView = PreviewView(ctx).apply {
+                        layoutParams = ViewGroup.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.MATCH_PARENT
+                        )
+                        // FILL_CENTER crops the image to fill screen. 
+                        // Coordinate math must match this.
+                        scaleType = PreviewView.ScaleType.FILL_CENTER
+                    }
+                    
+                    val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
+                    cameraProviderFuture.addListener({
+                        cameraProvider = cameraProviderFuture.get()
+                        
+                        // Setup Camera and capture the Camera object
+                        camera = setupCamera(
+                            previewView, 
+                            lifecycleOwner, 
+                            context, 
+                            barcodeScanner!!,
+                            analysisExecutor!!, 
+                            onBarcodeDetected = { barcode, rect ->
+                                qrBoundingBox = rect
+                                if (!isProcessing && barcode.startsWith("otpauth")) {
+                                    isProcessing = true
+                                    onCodeFound(barcode)
+                                    // Debounce
+                                    CoroutineScope(Dispatchers.Main).launch {
+                                        delay(2000)
+                                        isProcessing = false
+                                    }
+                                }
+                            }
+                        )
+                    }, ContextCompat.getMainExecutor(ctx))
+                    
+                    previewView
+                }
+            )
+            
+            // QR Overlay
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                qrBoundingBox?.let { box ->
+                    // Draw green bounding box
+                    drawRect(
+                        color = Color.Green.copy(alpha = 0.3f),
+                        topLeft = Offset(box.left, box.top),
+                        size = Size(box.width(), box.height()),
+                        style = Stroke(width = 3.dp.toPx())
+                    )
+                    
+                    // Animated Scan Line
+                    val lineY = box.top + (box.height() * scanLineY)
+                    drawLine(
+                        color = Color.Cyan,
+                        start = Offset(box.left, lineY),
+                        end = Offset(box.right, lineY),
+                        strokeWidth = 2.dp.toPx()
+                    )
+                    
+                    // Draw Corners
+                    val cornerLen = 20.dp.toPx()
+                    val stroke = 4.dp.toPx()
+                    val color = Color.Green
+
+                    // Top Left
+                    drawLine(color, Offset(box.left, box.top), Offset(box.left + cornerLen, box.top), stroke)
+                    drawLine(color, Offset(box.left, box.top), Offset(box.left, box.top + cornerLen), stroke)
+                    
+                    // Top Right
+                    drawLine(color, Offset(box.right, box.top), Offset(box.right - cornerLen, box.top), stroke)
+                    drawLine(color, Offset(box.right, box.top), Offset(box.right, box.top + cornerLen), stroke)
+
+                    // Bottom Left
+                    drawLine(color, Offset(box.left, box.bottom), Offset(box.left + cornerLen, box.bottom), stroke)
+                    drawLine(color, Offset(box.left, box.bottom), Offset(box.left, box.bottom - cornerLen), stroke)
+
+                    // Bottom Right
+                    drawLine(color, Offset(box.right, box.bottom), Offset(box.right - cornerLen, box.bottom), stroke)
+                    drawLine(color, Offset(box.right, box.bottom), Offset(box.right, box.bottom - cornerLen), stroke)
+                }
+            }
+            
+            // UI Controls
+            Column(
+                modifier = Modifier.fillMaxSize().padding(16.dp),
+                verticalArrangement = Arrangement.SpaceBetween
+            ) {
+                // Top Row
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    // Status Badge
+                    Card(colors = CardDefaults.cardColors(containerColor = Color.Black.copy(alpha = 0.6f))) {
+                        Row(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Box(modifier = Modifier.size(12.dp).background(Color.Green, MaterialTheme.shapes.small))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Scanning...", color = Color.White, style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
+                    
+                    // Torch Toggle
+                    IconButton(
+                        onClick = { torchEnabled = !torchEnabled },
+                        modifier = Modifier.background(Color.Black.copy(alpha = 0.6f), MaterialTheme.shapes.medium)
+                    ) {
+                        Icon(
+                            imageVector = if (torchEnabled) Icons.Default.FlashOn else Icons.Default.FlashOff,
+                            contentDescription = "Toggle Torch",
+                            tint = Color.White
+                        )
+                    }
+                }
+                
+                // Bottom Guidance
+                Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        "Align QR code within frame",
+                        color = Color.White,
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.padding(bottom = 8.dp)
+                    )
+                    Text(
+                        "Supports Google Authenticator QR codes",
+                        color = Color.White.copy(alpha = 0.8f),
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+        }
+    } else {
+        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(64.dp), tint = MaterialTheme.colorScheme.primary)
+                Text("Camera permission required", style = MaterialTheme.typography.titleMedium)
+                Button(onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) }) {
+                    Text("Grant Permission")
+                }
+            }
+        }
+    }
+}
+
+// FIX: Return Camera object to allow Torch control
+private fun setupCamera(
+    previewView: PreviewView,
+    lifecycleOwner: androidx.lifecycle.LifecycleOwner,
+    context: android.content.Context,
+    barcodeScanner: BarcodeScanner,
+    analysisExecutor: ExecutorService,
+    onBarcodeDetected: (String, RectF) -> Unit
+): Camera? {
+    val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
+    val cameraProvider = cameraProviderFuture.get()
+    
+    val cameraSelector = CameraSelector.Builder()
+        .requireLensFacing(CameraSelector.LENS_FACING_BACK)
+        .build()
+    
+    val preview = Preview.Builder()
+        .setTargetAspectRatio(AspectRatio.RATIO_16_9)
+        .build()
+        .also { it.setSurfaceProvider(previewView.surfaceProvider) }
+    
+    val imageAnalysis = ImageAnalysis.Builder()
+        .setTargetAspectRatio(AspectRatio.RATIO_16_9)
+        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+        .build()
+    
+    imageAnalysis.setAnalyzer(analysisExecutor) { imageProxy ->
+        val mediaImage = imageProxy.image ?: return@setAnalyzer
+        val image = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
+        
+        barcodeScanner.process(image)
+            .addOnSuccessListener { barcodes ->
+                if (barcodes.isNotEmpty()) {
+                    val barcode = barcodes[0]
+                    barcode.rawValue?.let { value ->
+                        barcode.boundingBox?.let { box ->
+                            // FIX: Coordinate Transformation
+                            val matrix = Matrix()
+                            val viewWidth = previewView.width.toFloat()
+                            val viewHeight = previewView.height.toFloat()
+                            
+                            // ImageProxy dimensions
+                            val rawW = imageProxy.width.toFloat()
+                            val rawH = imageProxy.height.toFloat()
+                            
+                            // Rotation handling: If 90 or 270, swap W/H
+                            val rotation = imageProxy.imageInfo.rotationDegrees
+                            val (imgW, imgH) = if (rotation == 90 || rotation == 270) {
+                                rawH to rawW
+                            } else {
+                                rawW to rawH
+                            }
+                            
+                            // FIX: Use MAX to emulate CENTER_CROP / FILL_CENTER
+                            val scale = max(viewWidth / imgW, viewHeight / imgH)
+                            
+                            val offsetX = (viewWidth - imgW * scale) / 2f
+                            val offsetY = (viewHeight - imgH * scale) / 2f
+                            
+                            matrix.setScale(scale, scale)
+                            matrix.postTranslate(offsetX, offsetY)
+                            
+                            val srcRectF = RectF(box)
+                            val dstRectF = RectF()
+                            matrix.mapRect(dstRectF, srcRectF)
+                            
+                            onBarcodeDetected(value, dstRectF)
+                        }
+                    }
+                }
+            }
+            .addOnCompleteListener { imageProxy.close() }
+    }
+    
+    return try {
+        cameraProvider.unbindAll()
+        // Return the Camera object
+        cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, imageAnalysis)
+    } catch (e: Exception) {
+        Log.e("CameraSetup", "Failed to bind camera", e)
+        null
+    }
+}
+--- End of ui\ScanScreen.kt ---
+
+│   ├── SettingsScreen.kt
+
+--- File: ui\SettingsScreen.kt ---
+package com.otp.auth.ui
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import com.otp.auth.data.AppThemeMode
+
+@Composable
+fun SettingsScreen(
+    currentMode: AppThemeMode,
+    isPrivacyEnabled: Boolean,
+    googleAccountEmail: String?,
+    onModeSelected: (AppThemeMode) -> Unit,
+    onPrivacyToggle: (Boolean) -> Unit,
+    onExportClick: () -> Unit,
+    onImportClick: () -> Unit,
+    onGoogleConnect: () -> Unit,
+    onGoogleSync: () -> Unit
+) {
+    val scrollState = rememberScrollState() // <--- Add scrolling
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(scrollState) // <--- Make entire content scrollable
+            .background(MaterialTheme.colorScheme.background)
+            .padding(16.dp)
+    ) {
+        Text(
+            text = "Settings",
+            style = MaterialTheme.typography.headlineMedium,
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.padding(bottom = 24.dp)
+        )
+
+        // --- Google Cloud Section ---
+        SettingsSectionTitle("Cloud Backup", Icons.Default.Cloud)
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(8.dp)) {
+                if (googleAccountEmail != null) {
+                    // Connected State
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Linked Account", style = MaterialTheme.typography.labelMedium)
+                            Text(
+                                googleAccountEmail,
+                                style = MaterialTheme.typography.bodyLarge,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        Icon(Icons.Default.CheckCircle, null, tint = Color(0xFF4CAF50))
+                    }
+                    Divider(color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.1f))
+                    SettingsActionRow(
+                        "Sync Now",
+                        "Backup/Restore to Drive",
+                        Icons.Default.Sync,
+                        onGoogleSync
+                    )
+                } else {
+                    // Disconnected State
+                    SettingsActionRow(
+                        "Link Google Account",
+                        "Backup to Google Drive",
+                        Icons.Default.AddLink,
+                        onGoogleConnect
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        // --- Security Section ---
+        SettingsSectionTitle("Security", Icons.Default.Lock)
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(8.dp)) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            "Privacy Screen",
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            "Require authentication to open",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(checked = isPrivacyEnabled, onCheckedChange = onPrivacyToggle)
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        // --- Theme Section ---
+        SettingsSectionTitle("Appearance", Icons.Default.DarkMode)
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(8.dp)) {
+                ThemeOptionRow("System Default", AppThemeMode.SYSTEM, currentMode, onModeSelected)
+                ThemeOptionRow("Light Theme", AppThemeMode.LIGHT, currentMode, onModeSelected)
+                ThemeOptionRow("Dark Theme", AppThemeMode.DARK, currentMode, onModeSelected)
+            }
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        // --- Local Backup Section ---
+        SettingsSectionTitle("Local Backup", Icons.Default.SdStorage)
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column {
+                SettingsActionRow(
+                    "Export to File",
+                    "Save .json backup",
+                    Icons.Default.FileUpload,
+                    onExportClick
+                )
+                Divider(color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.1f))
+                SettingsActionRow(
+                    "Import from File",
+                    "Restore from .json",
+                    Icons.Default.FileDownload,
+                    onImportClick
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun SettingsSectionTitle(text: String, icon: ImageVector) {
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 8.dp)) {
+        Icon(
+            icon,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(20.dp)
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            text,
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.primary
+        )
+    }
+}
+
+@Composable
+fun SettingsActionRow(title: String, subtitle: String, icon: ImageVector, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(16.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.width(16.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                title,
+                style = MaterialTheme.typography.bodyLarge,
+                fontWeight = FontWeight.SemiBold
+            )
+            Text(
+                subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+@Composable
+fun ThemeOptionRow(
+    text: String,
+    mode: AppThemeMode,
+    currentMode: AppThemeMode,
+    onClick: (AppThemeMode) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onClick(mode) }
+            .padding(vertical = 12.dp, horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        RadioButton(selected = (mode == currentMode), onClick = null)
+        Spacer(modifier = Modifier.width(16.dp))
+        Text(text, style = MaterialTheme.typography.bodyLarge)
+    }
+}
+
+@Composable
+fun PasswordDialog(title: String, onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
+    var password by remember { mutableStateOf("") }
+    androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
+        Card(
+            shape = RoundedCornerShape(16.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+        ) {
+            Column(
+                modifier = Modifier.padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    title,
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(Modifier.height(16.dp))
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    label = { Text("Encryption Password") },
+                    singleLine = true,
+                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(24.dp))
+                Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
+                    TextButton(onClick = onDismiss) { Text("Cancel") }
+                    Spacer(Modifier.width(8.dp))
+                    Button(onClick = { if (password.isNotEmpty()) onConfirm(password) }) {
+                        Text("Confirm")
+                    }
+                }
+            }
+        }
+    }
+}
+
+--- End of ui\SettingsScreen.kt ---
+
+│   └── theme
+│       ├── Color.kt
+
+--- File: ui\theme\Color.kt ---
+package com.otp.auth.ui.theme
+
+import androidx.compose.ui.graphics.Color
+
+// Light Colors
+val PrimaryLight = Color(0xFF6200EE)
+val OnPrimaryLight = Color(0xFFFFFFFF)
+val PrimaryContainerLight = Color(0xFFBB86FC)
+val OnPrimaryContainerLight = Color(0xFF3700B3)
+val SecondaryLight = Color(0xFF03DAC6)
+val BackgroundLight = Color(0xFFFFFBFE)
+val SurfaceLight = Color(0xFFFFFBFE)
+val OnSurfaceLight = Color(0xFF1C1B1F)
+
+// Dark Colors
+val PrimaryDark = Color(0xFFBB86FC)
+val OnPrimaryDark = Color(0xFF000000)
+val PrimaryContainerDark = Color(0xFF3700B3)
+val OnPrimaryContainerDark = Color(0xFFBB86FC)
+val SecondaryDark = Color(0xFF03DAC6)
+val BackgroundDark = Color(0xFF121212)
+val SurfaceDark = Color(0xFF1E1E1E) // Slightly lighter than background
+val OnSurfaceDark = Color(0xFFE6E1E5)
+--- End of ui\theme\Color.kt ---
+
+│       ├── Theme.kt
+
+--- File: ui\theme\Theme.kt ---
+package com.otp.auth.ui.theme
+
+import android.app.Activity
+import android.os.Build
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.material3.*
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
+import androidx.core.view.WindowCompat
+import com.otp.auth.data.AppThemeMode
+
+private val DarkColorScheme = darkColorScheme(
+    primary = PrimaryDark,
+    onPrimary = OnPrimaryDark,
+    primaryContainer = PrimaryContainerDark,
+    onPrimaryContainer = OnPrimaryContainerDark,
+    secondary = SecondaryDark,
+    background = BackgroundDark,
+    surface = SurfaceDark,
+    onSurface = OnSurfaceDark
+)
+
+private val LightColorScheme = lightColorScheme(
+    primary = PrimaryLight,
+    onPrimary = OnPrimaryLight,
+    primaryContainer = PrimaryContainerLight,
+    onPrimaryContainer = OnPrimaryContainerLight,
+    secondary = SecondaryLight,
+    background = BackgroundLight,
+    surface = SurfaceLight,
+    onSurface = OnSurfaceLight
+)
+
+@Composable
+fun OtpAuthTheme(
+    themeMode: AppThemeMode = AppThemeMode.SYSTEM,
+    // Dynamic color is available on Android 12+
+    dynamicColor: Boolean = true,
+    content: @Composable () -> Unit
+) {
+    val darkTheme = when (themeMode) {
+        AppThemeMode.LIGHT -> false
+        AppThemeMode.DARK -> true
+        AppThemeMode.SYSTEM -> isSystemInDarkTheme()
+    }
+
+    val colorScheme = when {
+        dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
+            val context = LocalContext.current
+            if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
+        }
+        darkTheme -> DarkColorScheme
+        else -> LightColorScheme
+    }
+
+    val view = LocalView.current
+    if (!view.isInEditMode) {
+        SideEffect {
+            val window = (view.context as Activity).window
+            window.statusBarColor = colorScheme.background.toArgb() // Match background
+            WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = !darkTheme
+        }
+    }
+
+    MaterialTheme(
+        colorScheme = colorScheme,
+        typography = Typography,
+        content = content
+    )
+}
+--- End of ui\theme\Theme.kt ---
+
+│       └── Type.kt
+
+--- File: ui\theme\Type.kt ---
+package com.otp.auth.ui.theme
+
+import androidx.compose.material3.Typography
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.sp
+
+// Set of Material typography styles to start with
+val Typography = Typography(
+    bodyLarge = TextStyle(
+        fontFamily = FontFamily.Default,
+        fontWeight = FontWeight.Normal,
+        fontSize = 16.sp,
+        lineHeight = 24.sp,
+        letterSpacing = 0.5.sp
+    )
+    /* Other default text styles to override
+    titleLarge = TextStyle(
+        fontFamily = FontFamily.Default,
+        fontWeight = FontWeight.Normal,
+        fontSize = 22.sp,
+        lineHeight = 28.sp,
+        letterSpacing = 0.sp
+    ),
+    labelSmall = TextStyle(
+        fontFamily = FontFamily.Default,
+        fontWeight = FontWeight.Medium,
+        fontSize = 11.sp,
+        lineHeight = 16.sp,
+        letterSpacing = 0.5.sp
+    )
+    */
+)
+--- End of ui\theme\Type.kt ---
+
+└── utils
+    ├── BackupHelper.kt
+
+--- File: utils\BackupHelper.kt ---
+package com.otp.auth.utils
+
+import android.content.Context
+import android.net.Uri
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
+import com.otp.auth.data.Account
+import java.io.InputStream
+import java.io.OutputStream
+import java.security.SecureRandom
+import javax.crypto.Cipher
+import javax.crypto.SecretKeyFactory
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.PBEKeySpec
+import javax.crypto.spec.SecretKeySpec
+
+object BackupHelper {
+    private const val SALT_SIZE = 16
+    private const val IV_SIZE = 12
+    private const val KEY_SIZE = 256
+    private const val ITERATIONS = 10000
+
+    // Export accounts to a secure file
+    fun exportAccounts(accounts: List<Account>, password: String, outputStream: OutputStream) {
+        val salt = ByteArray(SALT_SIZE).apply { SecureRandom().nextBytes(this) }
+        val secretKey = deriveKey(password, salt)
+
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, secretKey)
+        val iv = cipher.iv
+        
+        val json = Gson().toJson(accounts)
+        val encryptedData = cipher.doFinal(json.toByteArray(Charsets.UTF_8))
+
+        // File Format: [Salt (16)] [IV (12)] [Encrypted Data]
+        outputStream.write(salt)
+        outputStream.write(iv)
+        outputStream.write(encryptedData)
+        outputStream.flush()
+        outputStream.close()
+    }
+
+    // Import accounts from a secure file
+    fun importAccounts(password: String, inputStream: InputStream): List<Account> {
+        val bytes = inputStream.readBytes()
+        inputStream.close()
+
+        if (bytes.size < SALT_SIZE + IV_SIZE) throw IllegalArgumentException("Invalid file format")
+
+        val salt = bytes.copyOfRange(0, SALT_SIZE)
+        val iv = bytes.copyOfRange(SALT_SIZE, SALT_SIZE + IV_SIZE)
+        val encryptedData = bytes.copyOfRange(SALT_SIZE + IV_SIZE, bytes.size)
+
+        val secretKey = deriveKey(password, salt)
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        val spec = GCMParameterSpec(128, iv)
+        cipher.init(Cipher.DECRYPT_MODE, secretKey, spec)
+
+        val decryptedJson = String(cipher.doFinal(encryptedData), Charsets.UTF_8)
+        val type = object : TypeToken<List<Account>>() {}.type
+        return Gson().fromJson(decryptedJson, type)
+    }
+
+    private fun deriveKey(password: String, salt: ByteArray): SecretKeySpec {
+        val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+        val spec = PBEKeySpec(password.toCharArray(), salt, ITERATIONS, KEY_SIZE)
+        val tmp = factory.generateSecret(spec)
+        return SecretKeySpec(tmp.encoded, "AES")
+    }
+}
+--- End of utils\BackupHelper.kt ---
+
+    ├── GoogleAuthMigration.kt
+
+--- File: utils\GoogleAuthMigration.kt ---
+package com.otp.auth.utils
+
+import android.net.Uri
+import android.util.Base64
+import com.otp.auth.crypto.Base32
+import com.otp.auth.data.Account
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.net.URLEncoder
+import java.net.URLDecoder
+
+// Minimalist Protobuf Reader/Writer for Google Authenticator Migration
+object GoogleAuthMigration {
+
+    /* =======================
+       ======= IMPORT ========
+       ======================= */
+
+    fun parseMigrationUri(uriString: String): List<Account> {
+        val uri = Uri.parse(uriString)
+        val data = uri.getQueryParameter("data") ?: return emptyList()
+
+        // URL-decode first, then normalize Base64URL to standard Base64
+        val urlDecoded = URLDecoder.decode(data, "UTF-8")
+        val normalized = base64UrlToBase64(urlDecoded)
+        val bytes = Base64.decode(normalized, Base64.DEFAULT)
+
+        return parseProtobuf(bytes)
+    }
+
+    private fun parseProtobuf(bytes: ByteArray): List<Account> {
+        val accounts = mutableListOf<Account>()
+        val input = ByteArrayInputStream(bytes)
+
+        while (input.available() > 0) {
+            val tag = readVarInt(input)
+            val fieldNumber = tag ushr 3
+            val wireType = tag and 0x07
+
+            if (fieldNumber == 1 && wireType == 2) {
+                val length = readVarInt(input)
+                val paramBytes = ByteArray(length)
+                input.read(paramBytes)
+                parseOtpParameters(paramBytes)?.let { accounts.add(it) }
+            } else {
+                skipField(input, wireType)
+            }
+        }
+        return accounts
+    }
+
+    private fun parseOtpParameters(bytes: ByteArray): Account? {
+        val input = ByteArrayInputStream(bytes)
+        var secretBytes = ByteArray(0)
+        var name = ""
+        var issuer = ""
+
+        while (input.available() > 0) {
+            val tag = readVarInt(input)
+            val fieldNumber = tag ushr 3
+            val wireType = tag and 0x07
+
+            when (fieldNumber) {
+                1 -> {
+                    val len = readVarInt(input)
+                    secretBytes = ByteArray(len)
+                    input.read(secretBytes)
+                }
+                2 -> {
+                    val len = readVarInt(input)
+                    name = String(ByteArray(len).also { input.read(it) })
+                }
+                3 -> {
+                    val len = readVarInt(input)
+                    issuer = String(ByteArray(len).also { input.read(it) })
+                }
+                else -> skipField(input, wireType)
+            }
+        }
+
+        if (secretBytes.isEmpty()) return null
+
+        val secretBase32 = Base32.encode(secretBytes)
+
+        var finalIssuer = issuer
+        var finalLabel = name
+        if (issuer.isEmpty() && name.contains(":")) {
+            val split = name.split(":", limit = 2)
+            finalIssuer = split[0]
+            finalLabel = split[1]
+        }
+
+        return Account(
+            issuer = finalIssuer,
+            label = finalLabel,
+            secret = secretBase32
+        )
+    }
+
+    /* =======================
+       ======= EXPORT ========
+       ======================= */
+
+    fun getExportUris(accounts: List<Account>): List<String> {
+        val batchSize = 10
+        val batches = accounts.chunked(batchSize)
+        val uris = mutableListOf<String>()
+
+        batches.forEachIndexed { index, batch ->
+            val protoBytes = createBatchProtobuf(batch, index, batches.size)
+
+            // Base64URL encoding without padding
+            val base64Url = Base64.encodeToString(
+                protoBytes,
+                Base64.NO_WRAP or Base64.URL_SAFE
+            )
+
+            // URL-encode to fully match Google Authenticator export
+            val encodedData = URLEncoder.encode(base64Url, "UTF-8")
+            uris.add("otpauth-migration://offline?data=$encodedData")
+        }
+
+        return uris
+    }
+
+    private fun createBatchProtobuf(
+        accounts: List<Account>,
+        batchIndex: Int,
+        totalBatches: Int
+    ): ByteArray {
+        val output = ByteArrayOutputStream()
+
+        for (acc in accounts) {
+            val accBytes = createAccountProtobuf(acc)
+            writeTag(output, 1, 2)
+            writeVarInt(output, accBytes.size)
+            output.write(accBytes)
+        }
+
+        writeTag(output, 2, 0); writeVarInt(output, 1)           // Version
+        writeTag(output, 3, 0); writeVarInt(output, totalBatches) // Batch count
+        writeTag(output, 4, 0); writeVarInt(output, batchIndex)   // Batch index
+        writeTag(output, 5, 0); writeVarInt(output, (Math.random() * 1_000_000).toInt()) // Batch ID
+
+        return output.toByteArray()
+    }
+
+    private fun createAccountProtobuf(acc: Account): ByteArray {
+        val output = ByteArrayOutputStream()
+
+        try {
+            val rawSecret = Base32.decode(acc.secret)
+            writeTag(output, 1, 2)
+            writeVarInt(output, rawSecret.size)
+            output.write(rawSecret)
+        } catch (_: Exception) {}
+
+        val nameBytes = acc.label.toByteArray()
+        writeTag(output, 2, 2); writeVarInt(output, nameBytes.size); output.write(nameBytes)
+
+        val issuerBytes = acc.issuer.toByteArray()
+        writeTag(output, 3, 2); writeVarInt(output, issuerBytes.size); output.write(issuerBytes)
+
+        writeTag(output, 4, 0); writeVarInt(output, 1) // Algorithm SHA1
+        writeTag(output, 5, 0); writeVarInt(output, 1) // Digits 6
+        writeTag(output, 6, 0); writeVarInt(output, 2) // Type TOTP
+
+        return output.toByteArray()
+    }
+
+    /* =======================
+       ===== PROTO HELP ======
+       ======================= */
+
+    private fun writeTag(out: ByteArrayOutputStream, field: Int, wire: Int) {
+        writeVarInt(out, (field shl 3) or wire)
+    }
+
+    private fun writeVarInt(out: ByteArrayOutputStream, value: Int) {
+        var v = value
+        while (v and 0xFFFFFF80.toInt() != 0) {
+            out.write((v and 0x7F) or 0x80)
+            v = v ushr 7
+        }
+        out.write(v)
+    }
+
+    private fun readVarInt(input: ByteArrayInputStream): Int {
+        var result = 0
+        var shift = 0
+        while (true) {
+            val b = input.read()
+            if (b == -1) throw RuntimeException("EOF")
+            result = result or ((b and 0x7F) shl shift)
+            if (b and 0x80 == 0) return result
+            shift += 7
+        }
+    }
+
+    private fun skipField(input: ByteArrayInputStream, wireType: Int) {
+        when (wireType) {
+            0 -> readVarInt(input)
+            1 -> input.skip(8)
+            2 -> input.skip(readVarInt(input).toLong())
+            5 -> input.skip(4)
+        }
+    }
+
+    /* =======================
+       ===== UTILITIES =======
+       ======================= */
+
+    private fun base64UrlToBase64(input: String): String {
+        var s = input.replace('-', '+').replace('_', '/')
+        while (s.length % 4 != 0) s += "="
+        return s
+    }
+
+    private fun encodeBase32(bytes: ByteArray): String {
+        val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+        val out = StringBuilder()
+        var buffer = 0
+        var bitsLeft = 0
+
+        for (b in bytes) {
+            buffer = (buffer shl 8) or (b.toInt() and 0xFF)
+            bitsLeft += 8
+            while (bitsLeft >= 5) {
+                out.append(alphabet[(buffer shr (bitsLeft - 5)) and 31])
+                bitsLeft -= 5
+            }
+        }
+
+        if (bitsLeft > 0) {
+            out.append(alphabet[(buffer shl (5 - bitsLeft)) and 31])
+        }
+
+        return out.toString()
+    }
+}
+
+--- End of utils\GoogleAuthMigration.kt ---
+
+    └── GoogleDriveHelper.kt
+
+--- File: utils\GoogleDriveHelper.kt ---
+package com.otp.auth.utils
+
+import android.content.Context
+import com.google.android.gms.auth.api.signin.GoogleSignIn
+import com.google.android.gms.auth.api.signin.GoogleSignInAccount
+import com.google.android.gms.auth.api.signin.GoogleSignInClient
+import com.google.android.gms.auth.api.signin.GoogleSignInOptions
+import com.google.android.gms.common.api.Scope
+import com.google.api.client.googleapis.extensions.android.gms.auth.GoogleAccountCredential
+import com.google.api.client.http.ByteArrayContent
+import com.google.api.client.http.javanet.NetHttpTransport
+import com.google.api.client.json.gson.GsonFactory
+import com.google.api.services.drive.Drive
+import com.google.api.services.drive.DriveScopes
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
+import java.util.Collections
+
+object GoogleDriveHelper {
+    private const val BACKUP_FILE_NAME = "otp_auth_backup.bin"
+    private const val FOLDER_ID = "appDataFolder"
+
+    fun getSignInClient(context: Context): GoogleSignInClient {
+        val signInOptions = GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
+            .requestEmail()
+            .requestScopes(Scope(DriveScopes.DRIVE_APPDATA))
+            .build()
+        return GoogleSignIn.getClient(context, signInOptions)
+    }
+
+    fun getSignedInAccount(context: Context): GoogleSignInAccount? {
+        return GoogleSignIn.getLastSignedInAccount(context)
+    }
+
+    private fun getDriveService(context: Context, account: GoogleSignInAccount): Drive {
+        val credential = GoogleAccountCredential.usingOAuth2(
+            context, Collections.singleton(DriveScopes.DRIVE_APPDATA)
+        )
+        credential.selectedAccount = account.account
+
+        return Drive.Builder(
+            NetHttpTransport(),                 // Updated from AndroidHttp
+            GsonFactory.getDefaultInstance(),
+            credential
+        ).setApplicationName("OtpAuth").build()
+    }
+
+    suspend fun uploadBackup(context: Context, account: GoogleSignInAccount, encryptedData: ByteArray) = withContext(Dispatchers.IO) {
+        val service = getDriveService(context, account)
+
+        val fileList = service.files().list()
+            .setSpaces(FOLDER_ID)
+            .setQ("name = '$BACKUP_FILE_NAME' and trashed = false")
+            .setFields("files(id, name)")
+            .execute()
+
+        val fileContent = ByteArrayContent("application/octet-stream", encryptedData)
+
+        if (fileList.files.isEmpty()) {
+            val metadata = com.google.api.services.drive.model.File()
+                .setName(BACKUP_FILE_NAME)
+                .setParents(Collections.singletonList(FOLDER_ID))
+            service.files().create(metadata, fileContent).execute()
+        } else {
+            val fileId = fileList.files[0].id
+            service.files().update(fileId, null, fileContent).execute()
+        }
+    }
+
+    suspend fun downloadBackup(context: Context, account: GoogleSignInAccount): ByteArray? = withContext(Dispatchers.IO) {
+        val service = getDriveService(context, account)
+
+        val fileList = service.files().list()
+            .setSpaces(FOLDER_ID)
+            .setQ("name = '$BACKUP_FILE_NAME' and trashed = false")
+            .setFields("files(id)")
+            .execute()
+
+        if (fileList.files.isEmpty()) return@withContext null
+
+        val fileId = fileList.files[0].id
+        val outputStream = ByteArrayOutputStream()
+        service.files().get(fileId).executeMediaAndDownloadTo(outputStream)
+        return@withContext outputStream.toByteArray()
+    }
+}
+
+--- End of utils\GoogleDriveHelper.kt ---
+
