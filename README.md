@@ -12,7 +12,6 @@ Designed for security enthusiasts who want full control over their 2FA tokens wi
 |:-----------:|:-------:|:--------:|:---------:|
 | <img src="screenshots/home.jpg" width="200"/> | <img src="screenshots/scan.jpg" width="200"/> | <img src="screenshots/settings.jpg" width="200"/> | <img src="screenshots/dark.jpg" width="200"/> |
 
-*(Note: Replace the image paths above with your actual uploaded screenshots)*
 
 ---
 
