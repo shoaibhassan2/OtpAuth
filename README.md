@@ -65,6 +65,6 @@ Designed for security enthusiasts who want full control over their 2FA tokens wi
 
 ### 1. Clone the Repository
 ```bash
-git clone [https://github.com/shoaibhassan2/OtpAuth.git]
+git clone https://github.com/shoaibhassan2/OtpAuth.git
 cd OtpAuth
 ```
